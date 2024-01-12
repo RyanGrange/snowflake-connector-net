@@ -24,7 +24,7 @@ namespace Snowflake.Data.Core
     {
         static private SFLogger logger = SFLoggerFactory.GetLogger<SFBlockingChunkDownloaderV3>();
 
-        private List<SFReusableChunk> chunkDatas = new List<SFReusableChunk>();
+        private List<BaseResultChunk> chunkDatas = new List<BaseResultChunk>();
 
         private string qrmk;
 
@@ -37,7 +37,9 @@ namespace Snowflake.Data.Core
 
         private readonly int prefetchSlot;
 
-        private static IRestRequester restRequester = RestRequester.Instance;
+        private readonly IRestRequester _RestRequester;
+
+        private readonly SFSessionProperties sessionProperies;
 
         private Dictionary<string, string> chunkHeaders;
 
@@ -45,32 +47,40 @@ namespace Snowflake.Data.Core
 
         private readonly List<ExecResponseChunk> chunkInfos;
 
-        private readonly List<Task<IResultChunk>> taskQueues;
+        private readonly List<Task<BaseResultChunk>> taskQueues;
 
         public SFBlockingChunkDownloaderV3(int colCount,
             List<ExecResponseChunk> chunkInfos, string qrmk,
             Dictionary<string, string> chunkHeaders,
             CancellationToken cancellationToken,
-            SFBaseResultSet ResultSet)
+            SFBaseResultSet ResultSet,
+            ResultFormat resultFormat)
         {
             this.qrmk = qrmk;
             this.chunkHeaders = chunkHeaders;
             this.nextChunkToDownloadIndex = 0;
             this.ResultSet = ResultSet;
+            this._RestRequester = ResultSet.sfStatement.SfSession.restRequester;
+            this.sessionProperies = ResultSet.sfStatement.SfSession.properties;
             this.prefetchSlot = Math.Min(chunkInfos.Count, GetPrefetchThreads(ResultSet));
             this.chunkInfos = chunkInfos;
             this.nextChunkToConsumeIndex = 0;
-            this.taskQueues = new List<Task<IResultChunk>>();
+            this.taskQueues = new List<Task<BaseResultChunk>>();
+            externalCancellationToken = cancellationToken;
 
             for (int i=0; i<prefetchSlot; i++)
             {
-                SFReusableChunk reusableChunk = new SFReusableChunk(colCount);
-                reusableChunk.Reset(chunkInfos[nextChunkToDownloadIndex], nextChunkToDownloadIndex);
-                chunkDatas.Add(reusableChunk);
+                BaseResultChunk resultChunk = 
+                    resultFormat == ResultFormat.ARROW ? (BaseResultChunk)
+                        new ArrowResultChunk(colCount) :
+                        new SFReusableChunk(colCount);
+                
+                resultChunk.Reset(chunkInfos[nextChunkToDownloadIndex], nextChunkToDownloadIndex);
+                chunkDatas.Add(resultChunk);
 
                 taskQueues.Add(DownloadChunkAsync(new DownloadContextV3()
                 {
-                    chunk = reusableChunk,
+                    chunk = resultChunk,
                     qrmk = this.qrmk,
                     chunkHeaders = this.chunkHeaders,
                     cancellationToken = this.externalCancellationToken
@@ -87,23 +97,16 @@ namespace Snowflake.Data.Core
             return Int32.Parse(val);
         }
 
-
-        /*public Task<IResultChunk> GetNextChunkAsync()
+        public async Task<BaseResultChunk> GetNextChunkAsync()
         {
-            return _downloadTasks.IsCompleted ? Task.FromResult<SFResultChunk>(null) : _downloadTasks.Take();
-        }*/
-
-        public Task<IResultChunk> GetNextChunkAsync()
-        {
-            logger.InfoFmt("NextChunkToConsume: {0}, NextChunkToDownload: {1}",
-                nextChunkToConsumeIndex, nextChunkToDownloadIndex);
+            logger.Info($"NextChunkToConsume: {nextChunkToConsumeIndex}, NextChunkToDownload: {nextChunkToDownloadIndex}");
             if (nextChunkToConsumeIndex < chunkInfos.Count)
             {
-                Task<IResultChunk> chunk = taskQueues[nextChunkToConsumeIndex % prefetchSlot];
+                Task<BaseResultChunk> chunk = taskQueues[nextChunkToConsumeIndex % prefetchSlot];
 
                 if (nextChunkToDownloadIndex < chunkInfos.Count && nextChunkToConsumeIndex > 0)
                 {
-                    SFReusableChunk reusableChunk = chunkDatas[nextChunkToDownloadIndex % prefetchSlot];
+                    BaseResultChunk reusableChunk = chunkDatas[nextChunkToDownloadIndex % prefetchSlot];
                     reusableChunk.Reset(chunkInfos[nextChunkToDownloadIndex], nextChunkToDownloadIndex);
 
                     taskQueues[nextChunkToDownloadIndex % prefetchSlot] = DownloadChunkAsync(new DownloadContextV3()
@@ -114,63 +117,114 @@ namespace Snowflake.Data.Core
                         cancellationToken = externalCancellationToken
                     });
                     nextChunkToDownloadIndex++;
-                }
 
+                    // in case of one slot we need to return the chunk already downloaded
+                    if (prefetchSlot == 1)
+                    {
+                        chunk = taskQueues[0];
+                    }
+                }
                 nextChunkToConsumeIndex++;
-                return chunk;
+                return await chunk;
             }
             else
             {
-                return Task.FromResult<IResultChunk>(null);
+                return await Task.FromResult<BaseResultChunk>(null);
             }
         }
 
-        private async Task<IResultChunk> DownloadChunkAsync(DownloadContextV3 downloadContext)
+        private async Task<BaseResultChunk> DownloadChunkAsync(DownloadContextV3 downloadContext)
         {
-            //logger.Info($"Start donwloading chunk #{downloadContext.chunkIndex}");
-            SFReusableChunk chunk = downloadContext.chunk;
+            BaseResultChunk chunk = downloadContext.chunk;
+            int backOffInSec = 1;
+            bool retry = false;
+            int retryCount = 0;
+            int maxRetry = int.Parse(sessionProperies[SFSessionProperty.MAXHTTPRETRIES]);
 
-            S3DownloadRequest downloadRequest = new S3DownloadRequest()
+            do
             {
-                Url = new UriBuilder(chunk.Url).Uri,
-                qrmk = downloadContext.qrmk,
-                // s3 download request timeout to one hour
-                RestTimeout = TimeSpan.FromHours(1),
-                HttpTimeout = Timeout.InfiniteTimeSpan, // Disable timeout for each request
-                chunkHeaders = downloadContext.chunkHeaders
-            };
+                retry = false;
 
-            using (var httpResponse = await restRequester.GetAsync(downloadRequest, downloadContext.cancellationToken)
-                           .ConfigureAwait(continueOnCapturedContext: false))
-            using (Stream stream = await httpResponse.Content.ReadAsStreamAsync()
-                .ConfigureAwait(continueOnCapturedContext: false))
-            {
-                ParseStreamIntoChunk(stream, chunk);
-            }
-            logger.InfoFmt("Succeed downloading chunk #{0}", chunk.chunkIndexToDownload);
+                S3DownloadRequest downloadRequest =
+                    new S3DownloadRequest()
+                    {
+                        Url = new UriBuilder(chunk.Url).Uri,
+                        qrmk = downloadContext.qrmk,
+                        // s3 download request timeout to one hour
+                        RestTimeout = TimeSpan.FromHours(1),
+                        HttpTimeout = Timeout.InfiniteTimeSpan, // Disable timeout for each request
+                        chunkHeaders = downloadContext.chunkHeaders,
+                        sid = ResultSet.sfStatement.SfSession.sessionId
+                    };
+
+                using (var httpResponse = await _RestRequester.GetAsync(downloadRequest, downloadContext.cancellationToken)
+                               .ConfigureAwait(continueOnCapturedContext: false))
+                using (Stream stream = await httpResponse.Content.ReadAsStreamAsync()
+                    .ConfigureAwait(continueOnCapturedContext: false))
+                {
+                    // retry on chunk downloading since the retry logic in HttpClient.RetryHandler
+                    // doesn't cover this. The GET request could be succeeded but network error
+                    // still could happen during reading chunk data from stream and that needs
+                    // retry as well.
+                    try
+                    {
+                        IEnumerable<string> encoding;
+                        if (httpResponse.Content.Headers.TryGetValues("Content-Encoding", out encoding))
+                        {
+                            if (String.Compare(encoding.First(), "gzip", true) == 0)
+                            {
+                                Stream stream_gzip = new GZipStream(stream, CompressionMode.Decompress);
+                                await ParseStreamIntoChunk(stream_gzip, chunk);
+                            }
+                            else
+                            {
+                                await ParseStreamIntoChunk(stream, chunk);
+                            }
+                        }
+                        else
+                        {
+                            await ParseStreamIntoChunk(stream, chunk);
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        if ((maxRetry <= 0) || (retryCount < maxRetry))
+                        {
+                            retry = true;
+                            // reset the chunk before retry in case there could be garbage
+                            // data left from last attempt
+                            chunk.ResetForRetry();
+                            await Task.Delay(TimeSpan.FromSeconds(backOffInSec), downloadContext.cancellationToken).ConfigureAwait(false);
+                            ++retryCount;
+                            // Set next backoff time
+                            backOffInSec = backOffInSec * 2;
+                            if (backOffInSec > HttpUtil.MAX_BACKOFF)
+                            {
+                                backOffInSec = HttpUtil.MAX_BACKOFF;
+                            }
+                        }
+                        else
+                        {
+                            //parse error
+                            throw new Exception("parse stream to Chunk error. " + e);
+                        }
+                    }
+                }
+            } while (retry);
+            logger.Info($"Succeed downloading chunk #{chunk.ChunkIndex}");
             return chunk;
         }
-
-
-        /// <summary>
-        ///     Content from s3 in format of 
-        ///     ["val1", "val2", null, ...],
-        ///     ["val3", "val4", null, ...],
-        ///     ...
-        ///     To parse it as a json, we need to preappend '[' and append ']' to the stream 
-        /// </summary>
-        /// <param name="content"></param>
-        /// <param name="resultChunk"></param>
-        private void ParseStreamIntoChunk(Stream content, IResultChunk resultChunk)
+        
+        private async Task ParseStreamIntoChunk(Stream content, BaseResultChunk resultChunk)
         {
-            IChunkParser parser = new ReusableChunkParser(content);
-            parser.ParseChunk(resultChunk);
+            IChunkParser parser = ChunkParserFactory.Instance.GetParser(resultChunk.ResultFormat, content);
+            await parser.ParseChunk(resultChunk);
         }
     }
 
     class DownloadContextV3
     {
-        public SFReusableChunk chunk { get; set; }
+        public BaseResultChunk chunk { get; set; }
 
         public string qrmk { get; set; }
 

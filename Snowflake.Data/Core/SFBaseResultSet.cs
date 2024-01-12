@@ -3,12 +3,18 @@
  */
 
 using System;
+using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
+using Snowflake.Data.Client;
 
 namespace Snowflake.Data.Core
 {
+
     abstract class SFBaseResultSet
     {
+        internal abstract ResultFormat ResultFormat { get; }
+        
         internal SFStatement sfStatement;
 
         internal SFResultSetMetaData sfResultSetMetaData;
@@ -16,55 +22,79 @@ namespace Snowflake.Data.Core
         internal int columnCount;
 
         internal bool isClosed;
+        
+        internal string queryId;
 
         internal abstract bool Next();
 
         internal abstract Task<bool> NextAsync();
 
-        protected abstract string getObjectInternal(int columnIndex);
+        internal abstract bool NextResult();
 
-        private SFDataConverter dataConverter;
+        internal abstract Task<bool> NextResultAsync(CancellationToken cancellationToken);
+
+        internal abstract bool HasRows();
+
+        /// <summary>
+        /// Move cursor back one row.
+        /// </summary>
+        /// <returns>True if it works, false otherwise.</returns>
+        internal abstract bool Rewind();
 
         protected SFBaseResultSet()
         {
-            dataConverter = new SFDataConverter();
         }
+        
+        internal abstract bool IsDBNull(int ordinal);
 
-        internal T GetValue<T>(int columnIndex)
-        {
-            string val = getObjectInternal(columnIndex);
-            var types = sfResultSetMetaData.GetTypesByIndex(columnIndex);
-            return (T) dataConverter.ConvertToCSharpVal(val, types.Item1, typeof(T));
-        }
+        internal abstract object GetValue(int ordinal);
 
-        internal string GetString(int columnIndex)
-        {
-            var type = sfResultSetMetaData.getColumnTypeByIndex(columnIndex);
-            switch (type)
-            {
-                case SFDataType.DATE:
-                    var val = GetValue(columnIndex);
-                    if (val == DBNull.Value)
-                        return null;
-                    return SFDataConverter.toDateString((DateTime)val, 
-                        sfResultSetMetaData.dateOutputFormat);
-                //TODO: Implement SqlFormat for timestamp type, aka parsing format specified by user and format the value
-                default:
-                    return getObjectInternal(columnIndex); 
-            }
-        }
+        internal abstract bool GetBoolean(int ordinal);
 
-        internal object GetValue(int columnIndex)
-        {
-            string val = getObjectInternal(columnIndex);
-            var types = sfResultSetMetaData.GetTypesByIndex(columnIndex);
-            return dataConverter.ConvertToCSharpVal(val, types.Item1, types.Item2);
-        }
+        internal abstract byte GetByte(int ordinal);
+
+        internal abstract long GetBytes(int ordinal, long dataOffset, byte[] buffer, int bufferOffset, int length);
+
+        internal abstract char GetChar(int ordinal);
+
+        internal abstract long GetChars(int ordinal, long dataOffset, char[] buffer, int bufferOffset, int length);
+
+        internal abstract DateTime GetDateTime(int ordinal);
+
+        internal abstract TimeSpan GetTimeSpan(int ordinal);
+
+        internal abstract decimal GetDecimal(int ordinal);
+
+        internal abstract double GetDouble(int ordinal);
+
+        internal abstract float GetFloat(int ordinal);
+
+        internal abstract Guid GetGuid(int ordinal);
+
+        internal abstract short GetInt16(int ordinal);
+
+        internal abstract int GetInt32(int ordinal);
+
+        internal abstract long GetInt64(int ordinal);
+
+        internal abstract string GetString(int ordinal);
         
         internal void close()
         {
             isClosed = true;
         }
         
+        internal void ThrowIfClosed()
+        {
+            if (isClosed)
+                throw new SnowflakeDbException(SFError.DATA_READER_ALREADY_CLOSED);
+        }
+
+        internal void ThrowIfOutOfBounds(int ordinal)
+        {
+            if (ordinal < 0 || ordinal >= columnCount)
+                throw new SnowflakeDbException(SFError.COLUMN_INDEX_OUT_OF_BOUND, ordinal);
+        }
+
     }
 }

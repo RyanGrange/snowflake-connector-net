@@ -3,11 +3,13 @@
  */
 
 using System.IO;
+using System.Text;
 using Newtonsoft.Json;
 
 namespace Snowflake.Data.Core
 {
     using Snowflake.Data.Client;
+    using System.Threading.Tasks;
 
     public class FastStreamWrapper
     {
@@ -29,7 +31,6 @@ namespace Snowflake.Data.Core
                 return buffer[next++];
             else
                 return ReadByteSlow();
-
         }
 
         private int ReadByteSlow()
@@ -66,14 +67,16 @@ namespace Snowflake.Data.Core
             this.stream = stream;
         }
 
-        public void ParseChunk(IResultChunk chunk)
+        public async Task ParseChunk(IResultChunk chunk)
         {
             SFReusableChunk rc = (SFReusableChunk)chunk;
 
             bool inString = false;
             int c;
             var input = new FastStreamWrapper(stream);
-            MemoryStream ms = new MemoryStream();
+            var ms = new FastMemoryStream();
+            await Task.Run(() =>
+            {
             while ((c = input.ReadByte()) >= 0)
             {
                 if (!inString)
@@ -97,12 +100,13 @@ namespace Snowflake.Data.Core
                     // Anything else is saved in the buffer
                     if (c == '"')
                     {
-                        rc.AddCell(ms.GetBuffer(), (int)ms.Length);
-                        ms.SetLength(0);
+                        rc.AddCell(ms.GetBuffer(), ms.Length);
+                        ms.Clear();
                         inString = false;
                     }
                     else if (c == '\\')
                     {
+                        bool caseU = false;
                         // Process next character
                         c = input.ReadByte();
                         switch (c)
@@ -119,20 +123,36 @@ namespace Snowflake.Data.Core
                             case 't':
                                 c = '\t';
                                 break;
+                            case 'u':
+                                caseU = true;
+                                StringBuilder byteStr = new StringBuilder("");
+                                for (int i = 0; i < 4; i++)
+                                {
+                                    byteStr.Append((char)input.ReadByte());
+                                }
+                                int ascii = int.Parse(byteStr.ToString(), System.Globalization.NumberStyles.HexNumber);
+                                char asciiChar = (char)ascii;
+                                ms.WriteByte((byte)asciiChar);
+                                break;
                             case -1:
                                 throw new SnowflakeDbException(SFError.INTERNAL_ERROR, $"Unexpected end of stream in escape sequence");
+                            }
+                            // The 'u' case already writes to stream so skip to prevent re-writing
+                            // If not skipped, unicode characters are added an extra u (e.g "/u007f" becomes "/u007fu")
+                            if (!caseU)
+                            {
+                                ms.WriteByte((byte)c);
+                            }
                         }
-                        ms.WriteByte((byte)c);
-                    }
-                    else
-                    {
-                        ms.WriteByte((byte)c);
+                        else
+                        {
+                            ms.WriteByte((byte)c);
+                        }
                     }
                 }
-            }
-            if (inString)
-                throw new SnowflakeDbException(SFError.INTERNAL_ERROR, $"Unexpected end of stream in string");
+                if (inString)
+                    throw new SnowflakeDbException(SFError.INTERNAL_ERROR, $"Unexpected end of stream in string");
+            });
         }
     }
-
 }

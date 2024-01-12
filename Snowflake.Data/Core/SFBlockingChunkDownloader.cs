@@ -18,6 +18,7 @@ namespace Snowflake.Data.Core
     /// <summary>
     ///     Downloader implementation that will be blocked if main thread consume falls behind
     /// </summary>
+    [Obsolete("SFBlockingChunkDownloader is deprecated", false)]
     class SFBlockingChunkDownloader : IChunkDownloader
     {
         static private SFLogger logger = SFLoggerFactory.GetLogger<SFBlockingChunkDownloader>();
@@ -33,7 +34,7 @@ namespace Snowflake.Data.Core
 
         private readonly int prefetchThreads;
 
-        private static IRestRequester restRequester = RestRequester.Instance;
+        private readonly IRestRequester _RestRequester;
 
         private Dictionary<string, string> chunkHeaders;
 
@@ -50,7 +51,9 @@ namespace Snowflake.Data.Core
             this.chunks = new List<SFResultChunk>();
             this.nextChunkToDownloadIndex = 0;
             this.ResultSet = ResultSet;
+            this._RestRequester = ResultSet.sfStatement.SfSession.restRequester;
             this.prefetchThreads = GetPrefetchThreads(ResultSet);
+            externalCancellationToken = cancellationToken;
 
             var idx = 0;
             foreach(ExecResponseChunk chunkInfo in chunkInfos)
@@ -69,11 +72,11 @@ namespace Snowflake.Data.Core
             return Int32.Parse(val);
         }
 
-        private BlockingCollection<Task<IResultChunk>> _downloadTasks;
+        private BlockingCollection<Task<BaseResultChunk>> _downloadTasks;
         
         private void FillDownloads()
         {
-            _downloadTasks = new BlockingCollection<Task<IResultChunk>>(prefetchThreads);
+            _downloadTasks = new BlockingCollection<Task<BaseResultChunk>>(prefetchThreads);
 
             Task.Run(() =>
             {
@@ -93,11 +96,11 @@ namespace Snowflake.Data.Core
             });
         }
         
-        public Task<IResultChunk> GetNextChunkAsync()
+        public Task<BaseResultChunk> GetNextChunkAsync()
         {
             if (_downloadTasks.IsCompleted)
             {
-                return Task.FromResult<IResultChunk>(null);
+                return Task.FromResult<BaseResultChunk>(null);
             }
             else
             {
@@ -105,28 +108,27 @@ namespace Snowflake.Data.Core
             }
         }
         
-        private async Task<IResultChunk> DownloadChunkAsync(DownloadContext downloadContext)
+        private async Task<BaseResultChunk> DownloadChunkAsync(DownloadContext downloadContext)
         {
-            logger.Info($"Start donwloading chunk #{downloadContext.chunkIndex}");
-            SFResultChunk chunk = downloadContext.chunk;
+            logger.Info($"Start downloading chunk #{downloadContext.chunkIndex}");
+            BaseResultChunk chunk = downloadContext.chunk;
 
-            chunk.downloadState = DownloadState.IN_PROGRESS;
+            S3DownloadRequest downloadRequest = 
+                new S3DownloadRequest()
+                {
+                    Url = new UriBuilder(chunk.Url).Uri,
+                    qrmk = downloadContext.qrmk,
+                    // s3 download request timeout to one hour
+                    RestTimeout = TimeSpan.FromHours(1),
+                    HttpTimeout = TimeSpan.FromSeconds(32),
+                    chunkHeaders = downloadContext.chunkHeaders
+                };
 
-            S3DownloadRequest downloadRequest = new S3DownloadRequest()
-            {
-                Url = new UriBuilder(chunk.url).Uri,
-                qrmk = downloadContext.qrmk,
-                // s3 download request timeout to one hour
-                RestTimeout = TimeSpan.FromHours(1),
-                HttpTimeout = TimeSpan.FromSeconds(32),
-                chunkHeaders = downloadContext.chunkHeaders
-            };
 
-
-            var httpResponse = await restRequester.GetAsync(downloadRequest, downloadContext.cancellationToken).ConfigureAwait(false);
-            Stream stream = Task.Run(async() => await httpResponse.Content.ReadAsStreamAsync()).Result;
-            IEnumerable<string> encoding;
+            var httpResponse = await _RestRequester.GetAsync(downloadRequest, downloadContext.cancellationToken).ConfigureAwait(false);
+            Stream stream = Task.Run(async() => await (httpResponse.Content.ReadAsStreamAsync()).ConfigureAwait(false)).Result;
             //TODO this shouldn't be required.
+            IEnumerable<string> encoding;
             if (httpResponse.Content.Headers.TryGetValues("Content-Encoding", out encoding))
             {
                 if (String.Compare(encoding.First(), "gzip", true) == 0)
@@ -137,7 +139,6 @@ namespace Snowflake.Data.Core
 
             ParseStreamIntoChunk(stream, chunk);
 
-            chunk.downloadState = DownloadState.SUCCESS;
             logger.Info($"Succeed downloading chunk #{downloadContext.chunkIndex}");
 
             return chunk;
@@ -153,21 +154,21 @@ namespace Snowflake.Data.Core
         /// </summary>
         /// <param name="content"></param>
         /// <param name="resultChunk"></param>
-        private void ParseStreamIntoChunk(Stream content, SFResultChunk resultChunk)
+        private void ParseStreamIntoChunk(Stream content, BaseResultChunk resultChunk)
         {
             Stream openBracket = new MemoryStream(Encoding.UTF8.GetBytes("["));
             Stream closeBracket = new MemoryStream(Encoding.UTF8.GetBytes("]"));
 
             Stream concatStream = new ConcatenatedStream(new Stream[3] { openBracket, content, closeBracket});
 
-            IChunkParser parser = ChunkParserFactory.GetParser(concatStream);
+            IChunkParser parser = ChunkParserFactory.Instance.GetParser(resultChunk.ResultFormat, concatStream);
             parser.ParseChunk(resultChunk);
         }
     }
 
     class DownloadContext
     {
-        public SFResultChunk chunk { get; set; }
+        public BaseResultChunk chunk { get; set; }
 
         public int chunkIndex { get; set; }
 

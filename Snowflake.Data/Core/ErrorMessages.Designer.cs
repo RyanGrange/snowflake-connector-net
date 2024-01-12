@@ -95,7 +95,18 @@ namespace Snowflake.Data.Core {
                 return ResourceManager.GetString("INVALID_CONNECTION_STRING", resourceCulture);
             }
         }
-        
+
+        /// <summary>
+        ///   Looks up a localized string similar to Invalid parameter value {0} for {1}.
+        /// </summary>
+        internal static string INVALID_CONNECTION_PARAMETER_VALUE
+        {
+            get
+            {
+                return ResourceManager.GetString("INVALID_CONNECTION_PARAMETER_VALUE", resourceCulture);
+            }
+        }
+
         /// <summary>
         ///   Looks up a localized string similar to Failed to convert data {0} from type {0} to type {1}..
         /// </summary>
@@ -149,5 +160,40 @@ namespace Snowflake.Data.Core {
                 return ResourceManager.GetString("UNSUPPORTED_FEATURE", resourceCulture);
             }
         }
+
+        /// <summary>
+        ///   Looks up a localized string similar to "Could not read RSA private key {0} : {1}.".
+        /// </summary>
+        internal static string JWT_ERROR_READING_PK
+        {
+            get
+            {
+                return ResourceManager.GetString("JWT_ERROR_READING_PK", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string.
+        /// </summary>
+        internal static string UNSUPPORTED_DOTNET_TYPE
+        {
+            get
+            {
+                return ResourceManager.GetString("UNSUPPORTED_DOTNET_TYPE", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string.
+        /// </summary>
+        internal static string UNSUPPORTED_SNOWFLAKE_TYPE_FOR_PARAM
+        {
+            get
+            {
+                return ResourceManager.GetString("UNSUPPORTED_SNOWFLAKE_TYPE_FOR_PARAM", resourceCulture);
+            }
+        }
+
+        
     }
 }

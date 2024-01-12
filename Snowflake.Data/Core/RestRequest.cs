@@ -1,8 +1,7 @@
 ﻿/*
- * Copyright (c) 2012-2019 Snowflake Computing Inc. All rights reserved.
+ * Copyright (c) 2012-2021 Snowflake Computing Inc. All rights reserved.
  */
 
-using System.Threading;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System;
@@ -16,6 +15,7 @@ namespace Snowflake.Data.Core
     {
         HttpRequestMessage ToRequestMessage(HttpMethod method);
         TimeSpan GetRestTimeout();
+        string getSid();
     }
 
     /// <summary>
@@ -23,12 +23,22 @@ namespace Snowflake.Data.Core
     /// </summary>
     internal abstract class BaseRestRequest : IRestRequest
     {
-        private const string HTTP_REQUEST_TIMEOUT_KEY = "TIMEOUT_PER_HTTP_REQUEST";
+        internal static string HTTP_REQUEST_TIMEOUT_KEY = "TIMEOUT_PER_HTTP_REQUEST";
+
+        internal static string REST_REQUEST_TIMEOUT_KEY = "TIMEOUT_PER_REST_REQUEST";
+
+        // The default Rest timeout. Set to 120 seconds. 
+        public static int DEFAULT_REST_RETRY_SECONDS_TIMEOUT = 120;
+
         internal Uri Url { get; set; }
+
         /// <summary>
         /// Timeout of the overall rest request
         /// </summary>
         internal TimeSpan RestTimeout { get; set; }
+
+        internal String sid { get; set; }
+
         /// <summary>
         /// Timeout for every single HTTP request
         /// </summary>
@@ -43,12 +53,18 @@ namespace Snowflake.Data.Core
         {
             HttpRequestMessage message = new HttpRequestMessage(method, url);
             message.Properties[HTTP_REQUEST_TIMEOUT_KEY] = HttpTimeout;
+            message.Properties[REST_REQUEST_TIMEOUT_KEY] = RestTimeout;
             return message;
         }
 
         TimeSpan IRestRequest.GetRestTimeout()
         {
             return RestTimeout;
+        }
+
+        string IRestRequest.getSid()
+        {
+            return sid;
         }
     }
 
@@ -59,7 +75,6 @@ namespace Snowflake.Data.Core
         private const string SSE_C_KEY = "x-amz-server-side-encryption-customer-key";
 
         private const string SSE_C_AES = "AES256";
-
 
         internal string qrmk { get; set; }
 
@@ -88,16 +103,20 @@ namespace Snowflake.Data.Core
     internal class SFRestRequest : BaseRestRequest, IRestRequest
     {
         private static MediaTypeWithQualityHeaderValue applicationSnowflake = new MediaTypeWithQualityHeaderValue("application/snowflake");
+        private static MediaTypeWithQualityHeaderValue applicationJson = new MediaTypeWithQualityHeaderValue("application/json");
 
         private const string SF_AUTHORIZATION_HEADER = "Authorization";
         private const string SF_SERVICE_NAME_HEADER = "X-Snowflake-Service";
 
-        internal SFRestRequest()
+        private const string ClientAppId = "CLIENT_APP_ID";
+        private const string ClientAppVersion = "CLIENT_APP_VERSION";
+
+        internal SFRestRequest() : base()
         {
-            RestTimeout = Timeout.InfiniteTimeSpan;
+            RestTimeout = TimeSpan.FromSeconds(DEFAULT_REST_RETRY_SECONDS_TIMEOUT);
 
             // default each http request timeout to 16 seconds
-            HttpTimeout = TimeSpan.FromSeconds(16); 
+            HttpTimeout = TimeSpan.FromSeconds(16);
         }
 
         internal Object jsonBody { get; set;  }
@@ -105,7 +124,11 @@ namespace Snowflake.Data.Core
         internal String authorizationToken { get; set; }
 
         internal String serviceName { get; set; }
-        
+
+        internal bool isPutGet { get; set; }
+
+        internal bool _isLogin { get; set; }
+
         public override string ToString()
         {
             return String.Format("SFRestRequest {{url: {0}, request body: {1} }}", Url.ToString(), 
@@ -117,7 +140,7 @@ namespace Snowflake.Data.Core
             var message = newMessage(method, Url);
             if (method != HttpMethod.Get && jsonBody != null)
             {
-                var json = JsonConvert.SerializeObject(jsonBody);
+                var json = JsonConvert.SerializeObject(jsonBody, JsonUtils.JsonSettings);
                 //TODO: Check if we should use other encodings...
                 message.Content = new StringContent(json, Encoding.UTF8, "application/json");
             }
@@ -131,7 +154,21 @@ namespace Snowflake.Data.Core
             // add quote otherwise it would be reported as error format
             string osInfo = "(" + SFEnvironment.ClientEnv.osVersion + ")";
 
-            message.Headers.Accept.Add(applicationSnowflake);
+            if (isPutGet)
+            {
+                message.Headers.Accept.Add(applicationJson);
+            }
+            else
+            {
+                message.Headers.Accept.Add(applicationSnowflake);
+            }
+
+            if (_isLogin)
+            {
+                message.Headers.Add(ClientAppId, SFEnvironment.DriverName);
+                message.Headers.Add(ClientAppVersion, SFEnvironment.DriverVersion);
+            }
+
             message.Headers.UserAgent.Add(new ProductInfoHeaderValue(SFEnvironment.DriverName, SFEnvironment.DriverVersion));
             message.Headers.UserAgent.Add(new ProductInfoHeaderValue(osInfo));
             message.Headers.UserAgent.Add(new ProductInfoHeaderValue(
@@ -164,9 +201,15 @@ namespace Snowflake.Data.Core
         [JsonProperty(PropertyName = "BROWSER_MODE_REDIRECT_PORT", NullValueHandling = NullValueHandling.Ignore)]
         internal String BrowserModeRedirectPort { get; set; }
 
+        [JsonProperty(PropertyName = "CLIENT_APP_ID", NullValueHandling = NullValueHandling.Ignore)]
+        internal String DriverName { get; set; }
+
+        [JsonProperty(PropertyName = "CLIENT_APP_VERSION", NullValueHandling = NullValueHandling.Ignore)]
+        internal String DriverVersion { get; set; }
+
         public override string ToString()
         {
-            return String.Format("AuthenticatorRequestData {{ACCOUNT_NANM: {0} }}",
+            return String.Format("AuthenticatorRequestData {{ACCOUNT_NAME: {0} }}",
                 AccountName.ToString());
         }
     }
@@ -175,6 +218,11 @@ namespace Snowflake.Data.Core
     {
         [JsonProperty(PropertyName = "data")]
         internal LoginRequestData data { get; set; }
+
+        public override string ToString()
+        {
+            return String.Format("LoginRequest {{data: {0} }}", data.ToString());
+        }
     }
 
     class LoginRequestData
@@ -214,8 +262,8 @@ namespace Snowflake.Data.Core
 
         public override string ToString()
         {
-            return String.Format("LoginRequestData {{ClientAppVersion: {0} AccountName: {1}, loginName: {2}, ClientEnv: {3} }}", 
-                clientAppVersion, accountName, loginName, clientEnv.ToString());
+            return String.Format("LoginRequestData {{ClientAppVersion: {0},\n AccountName: {1},\n loginName: {2},\n ClientEnv: {3},\n authenticator: {4} }}", 
+                clientAppVersion, accountName, loginName, clientEnv.ToString(), Authenticator);
         }
     }
 
@@ -233,10 +281,16 @@ namespace Snowflake.Data.Core
         [JsonProperty(PropertyName = "NET_VERSION")]
         internal string netVersion { get; set; }
 
+        [JsonProperty(PropertyName = "INSECURE_MODE")]
+        internal string insecureMode { get; set; }
+
+        [JsonIgnore]
+        internal bool IsNetFramework => netRuntime.Contains("NETFramework");
+
         public override string ToString()
         {
-            return String.Format("{{ APPLICATION: {0}, OS_VERSION: {1}, NET_RUNTIME: {2}, NET_VERSION: {3} }}", 
-                application, osVersion, netRuntime, netVersion);
+            return String.Format("{{ APPLICATION: {0}, OS_VERSION: {1}, NET_RUNTIME: {2}, NET_VERSION: {3}, INSECURE_MODE: {4} }}", 
+                application, osVersion, netRuntime, netVersion, insecureMode);
         }
     }
 
@@ -250,6 +304,84 @@ namespace Snowflake.Data.Core
 
         [JsonProperty(PropertyName = "bindings")]
         internal Dictionary<string, BindingDTO> parameterBindings { get; set; }
+
+        [JsonProperty(PropertyName = "bindStage")]
+        internal string bindStage { get; set; }
+
+        [JsonProperty(PropertyName = "parameters")]
+        internal Dictionary<string, string> parameters { get; set; }
+
+        [JsonProperty(PropertyName = "queryContextDTO", NullValueHandling = NullValueHandling.Ignore)]
+        internal RequestQueryContext QueryContextDTO { get; set; }
+    }
+
+    // The query context in query response
+    internal class RequestQueryContext
+    {
+        [JsonProperty(PropertyName = "entries")]
+        internal List<RequestQueryContextElement> Entries { get; set; }
+    }
+
+    // The empty query context value in request
+    internal class QueryContextValueEmpty
+    {
+        // empty object with no filed
+    }
+
+    // The non-empty query context value in request
+    internal class QueryContextValue
+    {
+        // base64 encoded string of Opaque information
+        [JsonProperty(PropertyName = "base64Data")]
+        public string Base64Data { get; set; }
+
+        public QueryContextValue(string context)
+        {
+            Base64Data = context;
+        }
+    }
+
+    // The query context in query response
+    internal class RequestQueryContextElement
+    {
+        // database id as key. (bigint)
+        [JsonProperty(PropertyName = "id")]
+        public long Id { get; set; }
+
+        // When the query context read (bigint). Compare for same id.
+        [JsonProperty(PropertyName = "timestamp")]
+        public long ReadTimestamp { get; set; }
+
+        // Priority of the query context (bigint). Compare for different ids.
+        [JsonProperty(PropertyName = "priority")]
+        public long Priority { get; set; }
+
+        // Opaque information (object with a value of base64 encoded string).
+        [JsonProperty(PropertyName = "context")]
+        public object Context{ get; set; }
+
+        public void SetContext(string context)
+        {
+            if (context != null)
+            {
+                Context = new QueryContextValue(context);
+            }
+            else
+            {
+                Context = new QueryContextValueEmpty();
+            }
+        }
+
+        // default constructor for JSON converter
+        public RequestQueryContextElement() { }
+
+        public RequestQueryContextElement(QueryContextElement elem)
+        {
+            Id = elem.Id;
+            Priority = elem.Priority;
+            ReadTimestamp = elem.ReadTimestamp;
+            SetContext(elem.Context);
+        }
     }
 
     class QueryCancelRequest

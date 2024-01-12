@@ -8,46 +8,42 @@ using System.Text;
 
 namespace Snowflake.Data.Core
 {
-    class SFReusableChunk : IResultChunk
+    class SFReusableChunk : BaseResultChunk
     {
-       
-        public int RowCount { get; set; }
-
-        public int ColCount { get; set; }
-
-        public string Url { get; set; }
-
-        public int chunkIndexToDownload { get; set; }
-
+        internal override ResultFormat ResultFormat => ResultFormat.JSON;
+        
         private readonly BlockResultData data;
 
-        internal SFReusableChunk(int colCount)
+        private int _currentRowIndex = -1;
+
+        internal SFReusableChunk(int columnCount)
         {
-            ColCount = colCount;
+            ColumnCount = columnCount;
             data = new BlockResultData();
         }
 
-        internal void Reset(ExecResponseChunk chunkInfo, int chunkIndex)
+        internal override void Reset(ExecResponseChunk chunkInfo, int chunkIndex)
         {
-            this.RowCount = chunkInfo.rowCount;
-            this.Url = chunkInfo.url;
-            this.chunkIndexToDownload = chunkIndex;
-            data.Reset(this.RowCount, this.ColCount, chunkInfo.uncompressedSize);
+            base.Reset(chunkInfo, chunkIndex);
+            _currentRowIndex = -1;
+            data.Reset(RowCount, ColumnCount, chunkInfo.uncompressedSize);
         }
 
-        public int GetRowCount()
+        internal override void ResetForRetry()
         {
-            return RowCount;
+            data.ResetForRetry();
+        }
+        
+        [Obsolete("ExtractCell with rowIndex is deprecated", false)]
+        public override UTF8Buffer ExtractCell(int rowIndex, int columnIndex)
+        {
+            _currentRowIndex = rowIndex;
+            return ExtractCell(columnIndex);
         }
 
-        public int GetChunkIndex()
+        public override UTF8Buffer ExtractCell(int columnIndex)
         {
-            return chunkIndexToDownload;
-        }
-
-        public string ExtractCell(int rowIndex, int columnIndex)
-        {
-            return data.get(rowIndex * ColCount + columnIndex);
+            return data.get(_currentRowIndex * ColumnCount + columnIndex);
         }
 
         public void AddCell(string val)
@@ -59,6 +55,18 @@ namespace Snowflake.Data.Core
         public void AddCell(byte[] bytes, int length)
         {
             data.add(bytes, length);
+        }
+
+        internal override bool Next()
+        {
+            _currentRowIndex += 1;
+            return _currentRowIndex < RowCount;
+        }
+        
+        internal override bool Rewind()
+        {
+            _currentRowIndex -= 1;
+            return _currentRowIndex >= 0;
         }
 
         private class BlockResultData
@@ -95,10 +103,24 @@ namespace Snowflake.Data.Core
                 this.metaBlockCount = getMetaBlock(rowCount * colCount - 1) + 1;
             }
 
-            public String get(int index)
+            internal void ResetForRetry()
             {
-                int length = lengths[getMetaBlock(index)]
-                    [getMetaBlockIndex(index)];
+                currentDatOffset = 0;
+                nextIndex = 0;
+            }
+
+            public UTF8Buffer get(int index)
+            {
+                int block = getMetaBlock(index);
+                int blockIndex = getMetaBlockIndex(index);
+
+                if (block < 0 || block >= lengths.Count)
+                    return null;
+                if (blockIndex < 0 || block >= lengths[block].Length)
+                    return null;
+
+                int length = lengths[block][blockIndex];
+
                 if (length == NULL_VALUE)
                 {
                     return null;
@@ -124,11 +146,11 @@ namespace Snowflake.Data.Core
 
                             copied += copySize;
                         }
-                        return Encoding.UTF8.GetString(cell);
+                        return new UTF8Buffer(cell);
                     }
                     else
                     {
-                        return Encoding.UTF8.GetString(data[getBlock(offset)], getBlockOffset(offset), length);
+                        return new UTF8Buffer(data[getBlock(offset)], getBlockOffset(offset), length);
                     }
                 }
             }

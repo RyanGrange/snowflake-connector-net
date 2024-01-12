@@ -22,6 +22,8 @@ namespace Snowflake.Data.Core
 
         internal const string SF_QUERY_RETRY_COUNT = "retryCount";
 
+        internal const string SF_QUERY_RETRY_REASON = "retryReason";
+
         internal const string SF_QUERY_SESSION_DELETE = "delete";
     }
 
@@ -36,6 +38,8 @@ namespace Snowflake.Data.Core
         internal const string SF_AUTHENTICATOR_REQUEST_PATH = SF_SESSION_PATH + "/authenticator-request";
 
         internal const string SF_QUERY_PATH = "/queries/v1/query-request";
+
+        internal const string SF_SESSION_HEARTBEAT_PATH = SF_SESSION_PATH + "/heartbeat";
     }
 
     internal class SFEnvironment
@@ -46,9 +50,9 @@ namespace Snowflake.Data.Core
             {
                 application = System.Diagnostics.Process.GetCurrentProcess().ProcessName,
                 osVersion = System.Environment.OSVersion.VersionString,
-#if NET46
+#if NETFRAMEWORK
                 netRuntime = "NETFramework",
-                netVersion = "4.6",
+                netVersion = "4.7.1",
 #else
                 netRuntime = "NETCore",
                 netVersion ="2.0",
@@ -59,8 +63,9 @@ namespace Snowflake.Data.Core
             DriverName = ".NET";
         }
 
-        internal static string DriverName { get; private set; }
-        internal static string DriverVersion { get; private set; }
+        //temporary change for pretend as ODBC
+        internal static string DriverName { get; set; }
+        internal static string DriverVersion { get; set; }
         internal static LoginRequestClientEnv ClientEnv { get; private set; }
     }
 }

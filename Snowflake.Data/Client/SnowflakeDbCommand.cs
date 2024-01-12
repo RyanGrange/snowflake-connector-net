@@ -27,19 +27,20 @@ namespace Snowflake.Data.Client
 
         public SnowflakeDbCommand()
         {
-            logger.Debug("Constucting SnowflakeDbCommand class");
+            logger.Debug("Constructing SnowflakeDbCommand class");
             // by default, no query timeout
             this.CommandTimeout = 0;
             parameterCollection = new SnowflakeDbParameterCollection();
         }
 
-        public SnowflakeDbCommand(SnowflakeDbConnection connection)
+        public SnowflakeDbCommand(SnowflakeDbConnection connection) : this()
         {
-            logger.Debug("Constucting SnowflakeDbCommand class");
             this.connection = connection;
-            // by default, no query timeout
-            this.CommandTimeout = 0;
-            parameterCollection = new SnowflakeDbParameterCollection();
+        }
+
+        public SnowflakeDbCommand(SnowflakeDbConnection connection, string cmdText) : this(connection)
+        {
+            this.CommandText = cmdText;
         }
 
         public override string CommandText
@@ -128,7 +129,10 @@ namespace Snowflake.Data.Client
                 }
 
                 connection = sfc;
-                sfStatement = new SFStatement(sfc.SfSession);
+                if (sfc.SfSession != null)
+                {
+                    sfStatement = new SFStatement(sfc.SfSession);
+                }
             }
         }
 
@@ -155,24 +159,59 @@ namespace Snowflake.Data.Client
 
         public override int ExecuteNonQuery()
         {
-            logger.Debug($"ExecuteNonQuery, command: {CommandText}");
+            logger.Debug($"ExecuteNonQuery");
             SFBaseResultSet resultSet = ExecuteInternal();
-            return resultSet.CalculateUpdateCount();
+            long total = 0;
+            do
+            {
+                if (resultSet.HasResultSet()) continue;
+                int count = resultSet.CalculateUpdateCount();
+                if (count < 0)
+                {
+                    // exceeded max int, return -1
+                    return -1;
+                }
+                total += count;
+                if (total > int.MaxValue)
+                {
+                    return -1;
+                }
+            }
+            while (resultSet.NextResult());
+
+            return (int)total;
         }
 
         public override async Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
         {
-            logger.Debug($"ExecuteNonQueryAsync, command: {CommandText}");
-            if (cancellationToken.IsCancellationRequested)
-                throw new TaskCanceledException();
+            logger.Debug($"ExecuteNonQueryAsync");
+            cancellationToken.ThrowIfCancellationRequested();
 
             var resultSet = await ExecuteInternalAsync(cancellationToken).ConfigureAwait(false);
-            return resultSet.CalculateUpdateCount();
+            long total = 0;
+            do
+            {
+                if (resultSet.HasResultSet()) continue;
+                int count = resultSet.CalculateUpdateCount();
+                if (count < 0)
+                {
+                    // exceeded max int, return -1
+                    return -1;
+                }
+                total += count;
+                if (total > int.MaxValue)
+                {
+                    return -1;
+                }
+            }
+            while (await resultSet.NextResultAsync(cancellationToken).ConfigureAwait(false));
+
+            return (int)total;
         }
 
         public override object ExecuteScalar()
         {
-            logger.Debug($"ExecuteScalar, command: {CommandText}");
+            logger.Debug($"ExecuteScalar");
             SFBaseResultSet resultSet = ExecuteInternal();
 
             if(resultSet.Next())
@@ -183,9 +222,8 @@ namespace Snowflake.Data.Client
 
         public override async Task<object> ExecuteScalarAsync(CancellationToken cancellationToken)
         {
-            logger.Debug($"ExecuteScalarAsync, command: {CommandText}");
-            if (cancellationToken.IsCancellationRequested)
-                throw new TaskCanceledException();
+            logger.Debug($"ExecuteScalarAsync");
+            cancellationToken.ThrowIfCancellationRequested();
 
             var result = await ExecuteInternalAsync(cancellationToken).ConfigureAwait(false);
 
@@ -200,6 +238,15 @@ namespace Snowflake.Data.Client
             throw new NotImplementedException();
         }
 
+        public string GetQueryId()
+        {
+            if (sfStatement != null)
+            {
+                return sfStatement.GetQueryId();
+            }
+            return null;
+        }
+
         protected override DbParameter CreateDbParameter()
         {
             return new SnowflakeDbParameter();
@@ -207,16 +254,24 @@ namespace Snowflake.Data.Client
 
         protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
         {
-            logger.Debug($"ExecuteDbDataReader, command: {CommandText}");
+            logger.Debug($"ExecuteDbDataReader");
             SFBaseResultSet resultSet = ExecuteInternal();
             return new SnowflakeDbDataReader(this, resultSet);
         }
 
         protected override async Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
         {
-            logger.Debug($"ExecuteDbDataReaderAsync, command: {CommandText}");
-            var result = await ExecuteInternalAsync(cancellationToken).ConfigureAwait(false);
-            return new SnowflakeDbDataReader(this, result);
+            logger.Debug($"ExecuteDbDataReaderAsync");
+            try
+            {
+                var result = await ExecuteInternalAsync(cancellationToken).ConfigureAwait(false);
+                return new SnowflakeDbDataReader(this, result);
+            }
+            catch (Exception ex)
+            {
+                logger.Error("The command failed to execute.", ex);
+                throw;
+            }
         }
 
         private static Dictionary<string, BindingDTO> convertToBindList(List<SnowflakeDbParameter> parameters)

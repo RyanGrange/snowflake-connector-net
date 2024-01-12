@@ -1,5 +1,5 @@
 ﻿/*
- * Copyright (c) 2012-2019 Snowflake Computing Inc. All rights reserved.
+ * Copyright (c) 2012-2021 Snowflake Computing Inc. All rights reserved.
  */
 
 using System;
@@ -18,18 +18,45 @@ namespace Snowflake.Data.Client
     {
         private SFLogger logger = SFLoggerFactory.GetLogger<SnowflakeDbConnection>();
 
-        internal SFSession SfSession { get; private set; } 
+        internal SFSession SfSession { get; set; } 
 
-        private ConnectionState _connectionState;
+        internal ConnectionState _connectionState;
 
-        private int _connectionTimeout;
+        protected override DbProviderFactory DbProviderFactory => new SnowflakeDbFactory();
+        
+        internal int _connectionTimeout;
 
-        private bool disposed = false;
+        private bool _disposed = false;
+
+        private static Mutex _arraybindingMutex = new Mutex();
+
+        // TBD this doesn't make sense to have a static flag while reset it
+        // in each instance.
+        // Likely this should be a non-static one and the Mutex as well (if
+        // it's needed) since the stage is created per session
+        // Will fix that in a separated PR though as it's a different issue
+        private static Boolean _isArrayBindStageCreated;
+
+        protected enum TransactionRollbackStatus
+        {
+            Undefined, // used to indicate ignored transaction status when pool disabled
+            Success,
+            Failure
+        }
 
         public SnowflakeDbConnection()
         {
             _connectionState = ConnectionState.Closed;
-            _connectionTimeout = 0;
+            _connectionTimeout = 
+                int.Parse(SFSessionProperty.CONNECTION_TIMEOUT.GetAttribute<SFSessionPropertyAttr>().
+                    defaultValue);
+            _isArrayBindStageCreated = false;
+            ExplicitTransaction = null;
+        }
+
+        public SnowflakeDbConnection(string connectionString) : this()
+        {
+            ConnectionString = connectionString;
         }
 
         public override string ConnectionString
@@ -44,10 +71,15 @@ namespace Snowflake.Data.Client
 
         public bool IsOpen()
         {
-            return _connectionState == ConnectionState.Open;
+            return _connectionState == ConnectionState.Open && SfSession != null;
         }
 
-        public override string Database => _connectionState == ConnectionState.Open ? SfSession.database : string.Empty;
+        private bool IsNonClosedWithSession()
+        {
+            return _connectionState != ConnectionState.Closed && SfSession != null;
+        }
+
+        public override string Database => IsOpen() ? SfSession.database : string.Empty;
 
         public override int ConnectionTimeout => this._connectionTimeout;
 
@@ -59,6 +91,7 @@ namespace Snowflake.Data.Client
         ///     the connection to the database is open, the property returns what the native provider 
         ///     returns for the DBPROP_INIT_DATASOURCE, and if that is empty, the native provider's 
         ///     DBPROP_DATASOURCENAME is returned.
+        ///     Note: not yet implemented
         /// </summary>
         public override string DataSource
         {
@@ -68,9 +101,37 @@ namespace Snowflake.Data.Client
             }
         }
 
-        public override string ServerVersion => _connectionState == ConnectionState.Open ? SfSession.serverVersion : "";
+        public override string ServerVersion => IsOpen() ? SfSession.serverVersion : String.Empty;
 
         public override ConnectionState State => _connectionState;
+        internal SnowflakeDbTransaction ExplicitTransaction { get; set; } // tracks only explicit transaction operations
+        
+        internal bool HasActiveExplicitTransaction() => ExplicitTransaction != null && ExplicitTransaction.IsActive;
+
+        private TransactionRollbackStatus TerminateTransactionForDirtyConnectionReturningToPool()
+        {
+            if (!HasActiveExplicitTransaction())
+                return TransactionRollbackStatus.Success;
+            try
+            {
+                logger.Debug("Closing dirty connection: an active transaction exists in session: " + SfSession.sessionId);
+                using (IDbCommand command = CreateCommand())
+                {
+                    command.CommandText = "ROLLBACK";
+                    command.ExecuteNonQuery();
+                    // error to indicate a problem within application code that a connection was closed while still having a pending transaction
+                    logger.Error("Closing dirty connection: rollback transaction in session " + SfSession.sessionId + " succeeded.");
+                    ExplicitTransaction = null;
+                    return TransactionRollbackStatus.Success; 
+                }
+            }
+            catch (SnowflakeDbException exception)
+            {
+                // error to indicate a problem with rollback of an active transaction and inability to return dirty connection to the pool 
+                logger.Error("Closing dirty connection: rollback transaction in session: " + SfSession.sessionId + " failed, exception: " + exception.Message);
+                return TransactionRollbackStatus.Failure; // connection won't be pooled
+            }
+        }
 
         public override void ChangeDatabase(string databaseName)
         {
@@ -78,7 +139,7 @@ namespace Snowflake.Data.Client
 
             string alterDbCommand = $"use database {databaseName}";
 
-            using (IDbCommand cmd = this.CreateCommand())
+            using (IDbCommand cmd = CreateCommand())
             {
                 cmd.CommandText = alterDbCommand;
                 cmd.ExecuteNonQuery();
@@ -88,52 +149,194 @@ namespace Snowflake.Data.Client
         public override void Close()
         {
             logger.Debug("Close Connection.");
-
-            if (_connectionState != ConnectionState.Closed && SfSession != null)
+            if (IsNonClosedWithSession())
             {
-                SfSession.close();
-                _connectionState = ConnectionState.Closed;
+                var transactionRollbackStatus = SnowflakeDbConnectionPool.GetPooling() ? TerminateTransactionForDirtyConnectionReturningToPool() : TransactionRollbackStatus.Undefined;
+                
+                if (CanReuseSession(transactionRollbackStatus) && SnowflakeDbConnectionPool.AddSession(SfSession))
+                {
+                    logger.Debug($"Session pooled: {SfSession.sessionId}");
+                }
+                else
+                {
+                    SfSession.close();
+                }
+                SfSession = null;
             }
 
             _connectionState = ConnectionState.Closed;
         }
 
+#if NETCOREAPP3_0_OR_GREATER
+        // CloseAsync was added to IDbConnection as part of .NET Standard 2.1, first supported by .NET Core 3.0.
+        // Adding an override for CloseAsync will prevent the need for casting to SnowflakeDbConnection to call CloseAsync(CancellationToken).
+        public override async Task CloseAsync()
+        {
+            await CloseAsync(CancellationToken.None);
+        }
+#endif
+
+        public virtual Task CloseAsync(CancellationToken cancellationToken)
+        {
+            logger.Debug("Close Connection.");
+            TaskCompletionSource<object> taskCompletionSource = new TaskCompletionSource<object>();
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                taskCompletionSource.SetCanceled();
+            }
+            else
+            {
+                if (IsNonClosedWithSession())
+                {
+                    var transactionRollbackStatus = SnowflakeDbConnectionPool.GetPooling() ? TerminateTransactionForDirtyConnectionReturningToPool() : TransactionRollbackStatus.Undefined;
+
+                    if (CanReuseSession(transactionRollbackStatus) && SnowflakeDbConnectionPool.AddSession(SfSession))
+                    {
+                        logger.Debug($"Session pooled: {SfSession.sessionId}");
+                        _connectionState = ConnectionState.Closed;
+                        taskCompletionSource.SetResult(null);
+                    }
+                    else
+                    {
+                        SfSession.CloseAsync(cancellationToken).ContinueWith(
+                            previousTask =>
+                            {
+                                if (previousTask.IsFaulted)
+                                {
+                                    // Exception from SfSession.CloseAsync
+                                    logger.Error("Error closing the session", previousTask.Exception);
+                                    taskCompletionSource.SetException(previousTask.Exception);
+                                }
+                                else if (previousTask.IsCanceled)
+                                {
+                                    _connectionState = ConnectionState.Closed;
+                                    logger.Debug("Session close canceled");
+                                    taskCompletionSource.SetCanceled();
+                                }
+                                else
+                                {
+                                    logger.Debug("Session closed successfully");
+                                    _connectionState = ConnectionState.Closed;
+                                    taskCompletionSource.SetResult(null);
+                                }
+                            }, cancellationToken);
+                    }
+                }
+                else
+                {
+                    logger.Debug("Session not opened. Nothing to do.");
+                    taskCompletionSource.SetResult(null);
+                }
+            }
+            return taskCompletionSource.Task;
+        }
+
+        protected virtual bool CanReuseSession(TransactionRollbackStatus transactionRollbackStatus)
+        {
+            return SnowflakeDbConnectionPool.GetPooling() && 
+                   transactionRollbackStatus == TransactionRollbackStatus.Success;
+        }
+        
         public override void Open()
         {
             logger.Debug("Open Connection.");
-            SetSession();
+            if (_connectionState != ConnectionState.Closed)
+            {
+                logger.Debug($"Open with a connection already opened: {_connectionState}");
+                return;
+            }
             try
             {
-                SfSession.Open();
+                OnSessionConnecting();
+                SfSession = SnowflakeDbConnectionPool.GetSession(ConnectionString, Password);
+                if (SfSession == null)
+                    throw new SnowflakeDbException(SFError.INTERNAL_ERROR, "Could not open session");
+                logger.Debug($"Connection open with pooled session: {SfSession.sessionId}");
+                OnSessionEstablished();
             }
             catch (Exception e)
             {
                 // Otherwise when Dispose() is called, the close request would timeout.
                 _connectionState = ConnectionState.Closed;
-                throw e;
+                logger.Error("Unable to connect: ", e);
+                if (e is SnowflakeDbException)
+                {
+                    throw;
+                }
+                throw new SnowflakeDbException(
+                        e,
+                        SnowflakeDbException.CONNECTION_FAILURE_SSTATE,
+                        SFError.INTERNAL_ERROR,
+                        "Unable to connect. " + e.Message);
             }
-            OnSessionEstablished();
         }
-        
+
         public override Task OpenAsync(CancellationToken cancellationToken)
         {
             logger.Debug("Open Connection Async.");
-            if (cancellationToken.IsCancellationRequested)
-                return Task.FromCanceled(cancellationToken);
-
-            SetSession();
-            return SfSession.OpenAsync(cancellationToken).ContinueWith(t => OnSessionEstablished(), cancellationToken);
+            if (_connectionState != ConnectionState.Closed)
+            {
+                logger.Debug($"Open with a connection already opened: {_connectionState}");
+                return Task.CompletedTask;
+            }
+            registerConnectionCancellationCallback(cancellationToken);
+            OnSessionConnecting();
+            return SnowflakeDbConnectionPool
+                .GetSessionAsync(ConnectionString, Password, cancellationToken)
+                .ContinueWith(previousTask =>
+                {
+                    if (previousTask.IsFaulted)
+                    {
+                        // Exception from SfSession.OpenAsync
+                        Exception sfSessionEx = previousTask.Exception;
+                        _connectionState = ConnectionState.Closed;
+                        logger.Error("Unable to connect", sfSessionEx);
+                        throw new SnowflakeDbException(
+                           sfSessionEx,
+                           SnowflakeDbException.CONNECTION_FAILURE_SSTATE,
+                           SFError.INTERNAL_ERROR,
+                           "Unable to connect");
+                    }
+                    else if (previousTask.IsCanceled)
+                    {
+                        _connectionState = ConnectionState.Closed;
+                        logger.Debug("Connection canceled");
+                    }
+                    else
+                    {
+                        // Only continue if the session was opened successfully
+                        SfSession = previousTask.Result;
+                        logger.Debug($"Connection open with pooled session: {SfSession.sessionId}");
+                        OnSessionEstablished();
+                    }
+                },
+                cancellationToken);
         }
 
-        private void SetSession()
+        public Mutex GetArrayBindingMutex()
         {
-            SfSession = new SFSession(ConnectionString, Password);
-            _connectionTimeout = (int)SfSession.connectionTimeout.TotalSeconds;
+            return _arraybindingMutex;
+        }
+
+        public bool IsArrayBindStageCreated()
+        {
+            return _isArrayBindStageCreated;
+        }
+
+        public void SetArrayBindStageCreated()
+        {
+            _isArrayBindStageCreated = true;
+        }
+
+        private void OnSessionConnecting()
+        {
             _connectionState = ConnectionState.Connecting;
         }
 
         private void OnSessionEstablished()
         {
+            _connectionTimeout = (int)SfSession.connectionTimeout.TotalSeconds;
             _connectionState = ConnectionState.Open;
         }
 
@@ -151,18 +354,52 @@ namespace Snowflake.Data.Client
 
         protected override DbCommand CreateDbCommand()
         {
-            return new SnowflakeDbCommand(this);
+            var command = DbProviderFactory.CreateCommand();
+            command.Connection = this;
+            return command;
         }
 
         protected override void Dispose(bool disposing)
         {
-            if (disposed)
-                return;
-
-            this.Close();
-            disposed = true;
+            if (!_disposed)
+            {
+                if (disposing)
+                {
+                    try
+                    {
+                        Close();
+                    }
+                    catch (Exception ex)
+                    {
+                        // Prevent an exception from being thrown when disposing of this object
+                        logger.Error("Unable to close connection", ex);
+                    }
+                }
+                else
+                {
+                    SfSession?.close();
+                    SfSession = null;
+                    _connectionState = ConnectionState.Closed;
+                }
+                
+                _disposed = true;
+            }
 
             base.Dispose(disposing);
+        }
+
+
+        /// <summary>
+        ///     Register cancel callback. Two factors: either external cancellation token passed down from upper
+        ///     layer or timeout reached. Whichever comes first would trigger query cancellation.
+        /// </summary>
+        /// <param name="externalCancellationToken">cancellation token from upper layer</param>
+        internal void registerConnectionCancellationCallback(CancellationToken externalCancellationToken)
+        {
+            if (!externalCancellationToken.IsCancellationRequested)
+            {
+                externalCancellationToken.Register(() => { _connectionState = ConnectionState.Closed; });
+            }
         }
 
         ~SnowflakeDbConnection()

@@ -37,25 +37,29 @@ namespace Snowflake.Data.Core
         /// </summary>
         private Dictionary<string, int> columnNameToIndexCache = new Dictionary<string, int>();
 
-        internal SFResultSetMetaData(QueryExecResponseData queryExecResponseData)
+        internal SFResultSetMetaData(QueryExecResponseData queryExecResponseData, SFSession session)
         {
             rowTypes = queryExecResponseData.rowType;
             columnCount = rowTypes.Count;
-            statementType = findStatementTypeById(queryExecResponseData.statementTypeId);
+            statementType = FindStatementTypeById(queryExecResponseData.statementTypeId);
             columnTypes = InitColumnTypes();
-            
-            foreach (NameValueParameter parameter in queryExecResponseData.parameters)
+
+            if (session.ParameterMap.ContainsKey(SFSessionParameter.DATE_OUTPUT_FORMAT))
             {
-                switch(parameter.name)
-                {
-                    case "DATE_OUTPUT_FORMAT":
-                        dateOutputFormat = parameter.value;
-                        break;
-                    case "TIME_OUTPUT_FORMAT":
-                        timeOutputFormat = parameter.value;
-                        break;
-                }
+                dateOutputFormat = session.ParameterMap[SFSessionParameter.DATE_OUTPUT_FORMAT].ToString();
             }
+            if (session.ParameterMap.ContainsKey(SFSessionParameter.TIME_OUTPUT_FORMAT))
+            {
+                timeOutputFormat = session.ParameterMap[SFSessionParameter.TIME_OUTPUT_FORMAT].ToString();
+            }
+        }
+
+        internal SFResultSetMetaData(PutGetResponseData putGetResponseData)
+        {
+            rowTypes = putGetResponseData.rowType;
+            columnCount = rowTypes.Count;
+            statementType = FindStatementTypeById(putGetResponseData.statementTypeId);
+            columnTypes = InitColumnTypes();
         }
 
         private List<Tuple<SFDataType, Type>> InitColumnTypes()
@@ -75,10 +79,9 @@ namespace Snowflake.Data.Core
         /// <summary>
         /// </summary>
         /// <returns>index of column given a name, -1 if no column names are found</returns>
-        internal int getColumnIndexByName(string targetColumnName)
+        internal int GetColumnIndexByName(string targetColumnName)
         {
-            int resultIndex;
-            if (columnNameToIndexCache.TryGetValue(targetColumnName, out resultIndex))
+            if (columnNameToIndexCache.TryGetValue(targetColumnName, out var resultIndex))
             {
                 return resultIndex;
             }
@@ -87,9 +90,9 @@ namespace Snowflake.Data.Core
                 int indexCounter = 0;
                 foreach (ExecResponseRowType rowType in rowTypes)
                 {
-                    if (String.Compare(rowType.name, targetColumnName, false ) == 0 )
+                    if (String.Compare(rowType.name, targetColumnName, false) == 0 )
                     {
-                        logger.Info($"Found colun name {targetColumnName} under index {indexCounter}");
+                        logger.Info($"Found column name {targetColumnName} under index {indexCounter}");
                         columnNameToIndexCache[targetColumnName] = indexCounter;
                         return indexCounter;
                     }
@@ -99,24 +102,19 @@ namespace Snowflake.Data.Core
             return -1;
         }
         
-        internal SFDataType getColumnTypeByIndex(int targetIndex)
+        internal SFDataType GetColumnTypeByIndex(int targetIndex)
         {
-            if (targetIndex < 0 || targetIndex >= columnCount)
-            {
-                throw new SnowflakeDbException(SFError.COLUMN_INDEX_OUT_OF_BOUND, targetIndex);
-            }
-
             return columnTypes[targetIndex].Item1;
         }
 
         internal Tuple<SFDataType, Type> GetTypesByIndex(int targetIndex)
         {
-            if (targetIndex < 0 || targetIndex >= columnCount)
-            {
-                throw new SnowflakeDbException(SFError.COLUMN_INDEX_OUT_OF_BOUND, targetIndex);
-            }
-
             return columnTypes[targetIndex];
+        }
+
+        internal long GetScaleByIndex(int targetIndex)
+        {
+            return rowTypes[targetIndex].scale;
         }
 
         private SFDataType GetSFDataType(string type)
@@ -159,33 +157,17 @@ namespace Snowflake.Data.Core
             }
         }
         
-        internal Type getCSharpTypeByIndex(int targetIndex)
+        internal Type GetCSharpTypeByIndex(int targetIndex)
         {
-            if (targetIndex < 0 || targetIndex >= columnCount)
-            {
-                throw new SnowflakeDbException(SFError.COLUMN_INDEX_OUT_OF_BOUND, targetIndex);
-            }
-
-            SFDataType sfType = getColumnTypeByIndex(targetIndex);
-            return GetNativeTypeForColumn(sfType, rowTypes[targetIndex]);  
+            return columnTypes[targetIndex].Item2;  
         }
 
-        internal string getColumnNameByIndex(int targetIndex)
+        internal string GetColumnNameByIndex(int targetIndex)
         {
-            if (targetIndex < 0 || targetIndex >= columnCount)
-            {
-                throw new SnowflakeDbException(SFError.COLUMN_INDEX_OUT_OF_BOUND, targetIndex);
-            }
-
             return rowTypes[targetIndex].name;
         }
 
-        internal DataTable toDataTable()
-        {
-            return null;
-        }
-
-        private SFStatementType findStatementTypeById(long id)
+        private SFStatementType FindStatementTypeById(long id)
         {
             foreach (SFStatementType type in Enum.GetValues(typeof(SFStatementType)))
             {
@@ -225,7 +207,10 @@ namespace Snowflake.Data.Core
 
         [SFStatementTypeAttr(typeId = 0x1000)]
         SELECT,
-        
+
+        [SFStatementTypeAttr(typeId = 0x2000)]
+        EXPLAIN,
+
         /// <remark>
         ///     Data Manipulation Language 
         /// </remark>
@@ -243,6 +228,8 @@ namespace Snowflake.Data.Core
         MULTI_INSERT,
         [SFStatementTypeAttr(typeId = 0x3000 + 0x600)]
         COPY,
+        [SFStatementTypeAttr(typeId = 0x3000 + 0x700)]
+        COPY_UNLOAD,
 
         /// <remark>
         ///     System Command Language
@@ -263,6 +250,8 @@ namespace Snowflake.Data.Core
         SHOW,
         [SFStatementTypeAttr(typeId = 0x4000 + 0x500)]
         DESCRIBE,
+        [SFStatementTypeAttr(typeId = 0x4000 + 0x700 + 0x01)]
+        LIST_FILES,
 
         /// <remark>
         ///     Transaction Command Language
@@ -275,6 +264,38 @@ namespace Snowflake.Data.Core
         /// </remark>
         [SFStatementTypeAttr(typeId = 0x6000)]
         DDL,
+
+        /// <remark>
+        ///     Stage Operations
+        /// </remark>
+        [SFStatementTypeAttr(typeId = 0x7000)]
+        STAGE_FILE_OPERATIONS,
+        [SFStatementTypeAttr(typeId = 0x7000 + 0x100 + 0x01)]
+        GET_FILES,
+        [SFStatementTypeAttr(typeId = 0x7000 + 0x100 + 0x02)]
+        PUT_FILES,
+        [SFStatementTypeAttr(typeId = 0x7000 + 0x100 + 0x03)]
+        REMOVE_FILES,
+
+        /// <remark>
+        ///     Misc Query types
+        /// </remark>
+        [SFStatementTypeAttr(typeId = 0x8000)]
+        MISC_QUERY_TYPES,
+        [SFStatementTypeAttr(typeId = 0x8000 + 0x100 + 0x01)]
+        BEGIN,
+        [SFStatementTypeAttr(typeId = 0x8000 + 0x100 + 0x02)]
+        END,
+        [SFStatementTypeAttr(typeId = 0x8000 + 0x100 + 0x03)]
+        COMMIT,
+        [SFStatementTypeAttr(typeId = 0x8000 + 0x100 + 0x04)]
+        SET,
+
+        /// <remark>
+        ///     Procedure Call
+        /// </remark>
+        [SFStatementTypeAttr(typeId = 0x9000)]
+        CALL,
     }
 
     class SFStatementTypeAttr : Attribute

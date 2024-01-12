@@ -7,11 +7,13 @@ using System;
 
 namespace Snowflake.Data.Log
 {
-    class Log4netImpl : SFLogger
+    // Default implementation for SFLogger
+
+    class Log4NetImpl : SFLogger
     {
         private readonly ILog logger;
 
-        public Log4netImpl(ILog logger)
+        public Log4NetImpl(ILog logger)
         {
             this.logger = logger;
         }
@@ -43,52 +45,34 @@ namespace Snowflake.Data.Log
 
         public void Debug(string msg, Exception ex = null)
         {
+            msg = SecretDetector.MaskSecrets(msg).maskedText;
             logger.Debug(msg, ex);
-        }
-
-        public void DebugFmt(string fmt, params object[] args)
-        {
-            logger.DebugFormat(fmt, args);
         }
 
         public void Info(string msg, Exception ex = null)
         {
+            msg = SecretDetector.MaskSecrets(msg).maskedText;
             logger.Info(msg, ex);
-        }
-
-        public void InfoFmt(string fmt, params object[] args)
-        {
-            logger.InfoFormat(fmt, args);
         }
 
         public void Warn(string msg, Exception ex = null)
         {
+            msg = SecretDetector.MaskSecrets(msg).maskedText;
             logger.Warn(msg, ex);
         }
 
-        public void WarnFmt(string fmt, params object[] args)
-        {
-            logger.WarnFormat(fmt, args);
-        }
 
         public void Error(string msg, Exception ex = null)
         {
+            msg = SecretDetector.MaskSecrets(msg).maskedText;
             logger.Error(msg, ex);
-        }
-
-        public void ErrorFmt(string fmt, params object[] args)
-        {
-            logger.InfoFormat(fmt, args);
         }
 
         public void Fatal(string msg, Exception ex = null)
         {
+            msg = SecretDetector.MaskSecrets(msg).maskedText;
             logger.Fatal(msg, ex);
         }
-
-        public void FatalFmt(string fmt, params object[] args)
-        {
-            logger.InfoFormat(fmt, args);
-        }
     }
+
 }

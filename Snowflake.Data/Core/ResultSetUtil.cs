@@ -28,14 +28,27 @@ namespace Snowflake.Data.Core
                     resultSet.Next();
                     for (int i = 0; i < resultSet.columnCount; i++)
                     {
-                        updateCount += resultSet.GetValue<long>(i);
+                        updateCount += resultSet.GetInt64(i);
                     }
 
                     break;
                 case SFStatementType.COPY:
-                    resultSet.Next();
-                    var index = resultSet.sfResultSetMetaData.getColumnIndexByName("rows_loaded");
-                    if (index >= 0) updateCount = resultSet.GetValue<long>(index);
+                    var index = resultSet.sfResultSetMetaData.GetColumnIndexByName("rows_loaded");
+                    if (index >= 0)
+                    {
+                        resultSet.Next();
+                        updateCount = resultSet.GetInt64(index);
+                        resultSet.Rewind();
+                    }
+                    break;
+                case SFStatementType.COPY_UNLOAD:
+                    var rowIndex = resultSet.sfResultSetMetaData.GetColumnIndexByName("rows_unloaded");
+                    if (rowIndex >= 0)
+                    {
+                        resultSet.Next();
+                        updateCount = resultSet.GetInt64(rowIndex);
+                        resultSet.Rewind();
+                    }
                     break;
                 case SFStatementType.SELECT:
                     updateCount = -1;
@@ -49,6 +62,30 @@ namespace Snowflake.Data.Core
                 return -1;
 
             return (int)updateCount;
+        }
+
+        internal static bool HasResultSet(this SFBaseResultSet resultSet)
+        {
+            if (resultSet.isClosed) return false;
+
+            SFResultSetMetaData metaData = resultSet.sfResultSetMetaData;
+            SFStatementType statementType = metaData.statementType;
+
+            switch (statementType)
+            {
+                case SFStatementType.SELECT:
+                case SFStatementType.EXPLAIN:
+                case SFStatementType.SHOW:
+                case SFStatementType.DESCRIBE:
+                case SFStatementType.LIST_FILES:
+                case SFStatementType.GET_FILES:
+                case SFStatementType.PUT_FILES:
+                case SFStatementType.REMOVE_FILES:
+                case SFStatementType.CALL:
+                    return true;
+                default:
+                    return false;
+            }
         }
     }
 }

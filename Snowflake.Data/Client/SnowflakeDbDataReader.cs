@@ -10,6 +10,8 @@ using System.Data;
 using System.Threading;
 using System.Threading.Tasks;
 using Snowflake.Data.Log;
+using System.Text;
+using System.IO;
 
 namespace Snowflake.Data.Client
 {
@@ -23,15 +25,19 @@ namespace Snowflake.Data.Client
 
         private bool isClosed;
 
-        private readonly DataTable SchemaTable;
+        private DataTable SchemaTable;
 
+        private int RecordsAffectedInternal;
+
+        internal ResultFormat ResultFormat => resultSet.ResultFormat;
+        
         internal SnowflakeDbDataReader(SnowflakeDbCommand command, SFBaseResultSet resultSet)
         {
             this.dbCommand = command;
             this.resultSet = resultSet;
             this.isClosed = false;
             this.SchemaTable = PopulateSchemaTable(resultSet);
-            RecordsAffected = resultSet.CalculateUpdateCount();
+            RecordsAffectedInternal = resultSet.CalculateUpdateCount();
         }
 
         public override object this[string name]
@@ -70,9 +76,7 @@ namespace Snowflake.Data.Client
         {
             get
             {
-                // return true for now since every query returned from server
-                // will have at least one row
-                return true;
+                return resultSet.HasResultSet() && resultSet.HasRows();
             }
         }
 
@@ -84,13 +88,18 @@ namespace Snowflake.Data.Client
             }
         }
 
-        public override int RecordsAffected { get; }
+        public override int RecordsAffected { get { return RecordsAffectedInternal; } }
 
         public override DataTable GetSchemaTable()
         {
             return this.SchemaTable;
         }
 
+        public string GetQueryId()
+        {
+            return resultSet.queryId;
+        }
+        
         private DataTable PopulateSchemaTable(SFBaseResultSet resultSet)
         {
             var table = new DataTable("SchemaTable");
@@ -130,49 +139,53 @@ namespace Snowflake.Data.Client
 		
         public override bool GetBoolean(int ordinal)
         {
-            return resultSet.GetValue<bool>(ordinal);
+            return resultSet.GetBoolean(ordinal);
         }
 
         public override byte GetByte(int ordinal)
         {
-            byte[] bytes = resultSet.GetValue<byte[]>(ordinal);
-            return bytes[0];
+            return resultSet.GetByte(ordinal);
         }
 
         public override long GetBytes(int ordinal, long dataOffset, byte[] buffer, int bufferOffset, int length)
         {
-            throw new NotImplementedException();
+            return resultSet.GetBytes(ordinal, dataOffset, buffer, bufferOffset, length);
         }
 
         public override char GetChar(int ordinal)
         {
-            string val = resultSet.GetString(ordinal);
-            return val[0];
+            return resultSet.GetChar(ordinal);
         }
 
         public override long GetChars(int ordinal, long dataOffset, char[] buffer, int bufferOffset, int length)
         {
-            throw new NotImplementedException();
+            return resultSet.GetChars(ordinal, dataOffset, buffer, bufferOffset, length);
         }
 
         public override string GetDataTypeName(int ordinal)
         {
-            return resultSet.sfResultSetMetaData.getColumnTypeByIndex(ordinal).ToString();
+            resultSet.ThrowIfOutOfBounds(ordinal);
+            return resultSet.sfResultSetMetaData.GetColumnTypeByIndex(ordinal).ToString();
         }
 
         public override DateTime GetDateTime(int ordinal)
         {
-            return resultSet.GetValue<DateTime>(ordinal);
+            return resultSet.GetDateTime(ordinal);
+        }
+
+        public TimeSpan GetTimeSpan(int ordinal)
+        {
+            return resultSet.GetTimeSpan(ordinal);
         }
 
         public override decimal GetDecimal(int ordinal)
         {
-            return resultSet.GetValue<decimal>(ordinal);
+            return resultSet.GetDecimal(ordinal);
         }
 
         public override double GetDouble(int ordinal)
         {
-            return resultSet.GetValue<double>(ordinal);
+            return resultSet.GetDouble(ordinal);
         }
 
         public override IEnumerator GetEnumerator()
@@ -182,42 +195,44 @@ namespace Snowflake.Data.Client
 
         public override Type GetFieldType(int ordinal)
         {
-            return resultSet.sfResultSetMetaData.getCSharpTypeByIndex(ordinal);
+            resultSet.ThrowIfOutOfBounds(ordinal);
+            return resultSet.sfResultSetMetaData.GetCSharpTypeByIndex(ordinal);
         }
 
         public override float GetFloat(int ordinal)
         {
-            return resultSet.GetValue<float>(ordinal);
+            return resultSet.GetFloat(ordinal);
         }
 
         public override Guid GetGuid(int ordinal)
         {
-            return resultSet.GetValue<Guid>(ordinal);
+            return resultSet.GetGuid(ordinal);
         }
 
         public override short GetInt16(int ordinal)
         {
-            return resultSet.GetValue<short>(ordinal);
+            return resultSet.GetInt16(ordinal);
         }
 
         public override int GetInt32(int ordinal)
         {
-            return resultSet.GetValue<int>(ordinal);
+            return resultSet.GetInt32(ordinal);
         }
 
         public override long GetInt64(int ordinal)
         {
-            return resultSet.GetValue<long>(ordinal);
+            return resultSet.GetInt64(ordinal);
         }
 
         public override string GetName(int ordinal)
         {
-            return resultSet.sfResultSetMetaData.getColumnNameByIndex(ordinal);
+            resultSet.ThrowIfOutOfBounds(ordinal);
+            return resultSet.sfResultSetMetaData.GetColumnNameByIndex(ordinal);
         }
 
         public override int GetOrdinal(string name)
         {
-            return resultSet.sfResultSetMetaData.getColumnIndexByName(name);
+            return resultSet.sfResultSetMetaData.GetColumnIndexByName(name);
         }
 
         public override string GetString(int ordinal)
@@ -242,11 +257,28 @@ namespace Snowflake.Data.Client
 
         public override bool IsDBNull(int ordinal)
         {
-            return resultSet.GetValue(ordinal) == DBNull.Value;
+            return resultSet.IsDBNull(ordinal);
         }
 
         public override bool NextResult()
         {
+            if (resultSet.NextResult())
+            {
+                this.SchemaTable = PopulateSchemaTable(resultSet);
+                RecordsAffectedInternal = resultSet.CalculateUpdateCount();
+                return true;
+            }
+            return false;
+        }
+
+        public override async Task<bool> NextResultAsync(CancellationToken cancellationToken)
+        {
+            if (await resultSet.NextResultAsync(cancellationToken).ConfigureAwait(false))
+            {
+                this.SchemaTable = PopulateSchemaTable(resultSet);
+                RecordsAffectedInternal = resultSet.CalculateUpdateCount();
+                return true;
+            }
             return false;
         }
 
@@ -255,12 +287,11 @@ namespace Snowflake.Data.Client
             return resultSet.Next();
         }
 
-        public override Task<bool> ReadAsync(CancellationToken cancellationToken)
+        public override async Task<bool> ReadAsync(CancellationToken cancellationToken)
         {
-            if (cancellationToken.IsCancellationRequested)
-                throw new TaskCanceledException();
+            cancellationToken.ThrowIfCancellationRequested();
 
-            return resultSet.NextAsync();
+            return await resultSet.NextAsync();
         }
 
         public override void Close()
@@ -269,5 +300,6 @@ namespace Snowflake.Data.Client
             resultSet.close();
             isClosed = true;
         }
+
     }
 }

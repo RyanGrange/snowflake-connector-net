@@ -60,6 +60,24 @@ namespace Snowflake.Data.Core
 
         [SFErrorAttr(errorCode = 270051)]
         BROWSER_RESPONSE_INVALID_PREFIX,
+
+        [SFErrorAttr(errorCode = 270052)]
+        JWT_ERROR_READING_PK,
+
+        [SFErrorAttr(errorCode = 270053)]
+        UNSUPPORTED_DOTNET_TYPE,
+
+        [SFErrorAttr(errorCode = 270054)]
+        UNSUPPORTED_SNOWFLAKE_TYPE_FOR_PARAM,
+
+        [SFErrorAttr(errorCode = 270055)]
+        INVALID_CONNECTION_PARAMETER_VALUE,
+
+        [SFErrorAttr(errorCode = 270056)]
+        INVALID_BROWSER_URL,
+
+        [SFErrorAttr(errorCode = 270057)]
+        BROWSER_RESPONSE_TIMEOUT,
     }
 
     class SFErrorAttr : Attribute

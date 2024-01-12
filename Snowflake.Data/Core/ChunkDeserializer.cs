@@ -3,6 +3,7 @@
  */
 
 using System.IO;
+using System.Threading.Tasks;
 using Newtonsoft.Json;
 
 namespace Snowflake.Data.Core
@@ -18,14 +19,17 @@ namespace Snowflake.Data.Core
             this.stream = stream;
         }
 
-        public void ParseChunk(IResultChunk chunk)
+        public async Task ParseChunk(IResultChunk chunk)
         {
-            // parse results row by row
-            using (StreamReader sr = new StreamReader(stream))
-            using (JsonTextReader jr = new JsonTextReader(sr))
+            await Task.Run(() =>
             {
-                ((SFResultChunk)chunk).rowSet = JsonSerializer.Deserialize<string[,]>(jr);
-            }
+                // parse results row by row
+                using (StreamReader sr = new StreamReader(stream))
+                using (JsonTextReader jr = new JsonTextReader(sr))
+                {
+                    ((SFResultChunk)chunk).RowSet = JsonSerializer.Deserialize<string[,]>(jr);
+                }
+            });
         }
     }
 }
