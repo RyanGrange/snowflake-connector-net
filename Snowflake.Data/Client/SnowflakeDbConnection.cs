@@ -18,12 +18,12 @@ namespace Snowflake.Data.Client
     {
         private SFLogger logger = SFLoggerFactory.GetLogger<SnowflakeDbConnection>();
 
-        internal SFSession SfSession { get; set; } 
+        internal SFSession SfSession { get; set; }
 
         internal ConnectionState _connectionState;
 
         protected override DbProviderFactory DbProviderFactory => new SnowflakeDbFactory();
-        
+
         internal int _connectionTimeout;
 
         private bool _disposed = false;
@@ -47,7 +47,7 @@ namespace Snowflake.Data.Client
         public SnowflakeDbConnection()
         {
             _connectionState = ConnectionState.Closed;
-            _connectionTimeout = 
+            _connectionTimeout =
                 int.Parse(SFSessionProperty.CONNECTION_TIMEOUT.GetAttribute<SFSessionPropertyAttr>().
                     defaultValue);
             _isArrayBindStageCreated = false;
@@ -84,12 +84,12 @@ namespace Snowflake.Data.Client
         public override int ConnectionTimeout => this._connectionTimeout;
 
         /// <summary>
-        ///     If the connection to the database is closed, the DataSource returns whatever is contained 
-        ///     in the ConnectionString for the DataSource keyword. If the connection is open and the 
-        ///     ConnectionString data source keyword's value starts with "|datadirectory|", the property 
-        ///     returns whatever is contained in the ConnectionString for the DataSource keyword only. If 
-        ///     the connection to the database is open, the property returns what the native provider 
-        ///     returns for the DBPROP_INIT_DATASOURCE, and if that is empty, the native provider's 
+        ///     If the connection to the database is closed, the DataSource returns whatever is contained
+        ///     in the ConnectionString for the DataSource keyword. If the connection is open and the
+        ///     ConnectionString data source keyword's value starts with "|datadirectory|", the property
+        ///     returns whatever is contained in the ConnectionString for the DataSource keyword only. If
+        ///     the connection to the database is open, the property returns what the native provider
+        ///     returns for the DBPROP_INIT_DATASOURCE, and if that is empty, the native provider's
         ///     DBPROP_DATASOURCENAME is returned.
         ///     Note: not yet implemented
         /// </summary>
@@ -105,8 +105,36 @@ namespace Snowflake.Data.Client
 
         public override ConnectionState State => _connectionState;
         internal SnowflakeDbTransaction ExplicitTransaction { get; set; } // tracks only explicit transaction operations
-        
+
+        public void PreventPooling()
+        {
+            if (SfSession == null)
+            {
+                throw new Exception("Session not yet created for this connection. Unable to prevent the session from pooling");
+            }
+            SfSession.SetPooling(false);
+            logger.Debug($"Session {SfSession.sessionId} marked not to be pooled any more");
+        }
+
         internal bool HasActiveExplicitTransaction() => ExplicitTransaction != null && ExplicitTransaction.IsActive;
+
+        private bool TryToReturnSessionToPool()
+        {
+            var pooling = SnowflakeDbConnectionPool.GetPooling() && SfSession.GetPooling();
+            var transactionRollbackStatus = pooling ? TerminateTransactionForDirtyConnectionReturningToPool() : TransactionRollbackStatus.Undefined;
+            var canReuseSession = CanReuseSession(transactionRollbackStatus);
+            if (!canReuseSession)
+            {
+                SnowflakeDbConnectionPool.ReleaseBusySession(SfSession);
+                return false;
+            }
+            var sessionReturnedToPool = SnowflakeDbConnectionPool.AddSession(SfSession);
+            if (sessionReturnedToPool)
+            {
+                logger.Debug($"Session pooled: {SfSession.sessionId}");
+            }
+            return sessionReturnedToPool;
+        }
 
         private TransactionRollbackStatus TerminateTransactionForDirtyConnectionReturningToPool()
         {
@@ -122,12 +150,12 @@ namespace Snowflake.Data.Client
                     // error to indicate a problem within application code that a connection was closed while still having a pending transaction
                     logger.Error("Closing dirty connection: rollback transaction in session " + SfSession.sessionId + " succeeded.");
                     ExplicitTransaction = null;
-                    return TransactionRollbackStatus.Success; 
+                    return TransactionRollbackStatus.Success;
                 }
             }
-            catch (SnowflakeDbException exception)
+            catch (Exception exception)
             {
-                // error to indicate a problem with rollback of an active transaction and inability to return dirty connection to the pool 
+                // error to indicate a problem with rollback of an active transaction and inability to return dirty connection to the pool
                 logger.Error("Closing dirty connection: rollback transaction in session: " + SfSession.sessionId + " failed, exception: " + exception.Message);
                 return TransactionRollbackStatus.Failure; // connection won't be pooled
             }
@@ -151,19 +179,13 @@ namespace Snowflake.Data.Client
             logger.Debug("Close Connection.");
             if (IsNonClosedWithSession())
             {
-                var transactionRollbackStatus = SnowflakeDbConnectionPool.GetPooling() ? TerminateTransactionForDirtyConnectionReturningToPool() : TransactionRollbackStatus.Undefined;
-                
-                if (CanReuseSession(transactionRollbackStatus) && SnowflakeDbConnectionPool.AddSession(SfSession))
-                {
-                    logger.Debug($"Session pooled: {SfSession.sessionId}");
-                }
-                else
+                var returnedToPool = TryToReturnSessionToPool();
+                if (!returnedToPool)
                 {
                     SfSession.close();
                 }
                 SfSession = null;
             }
-
             _connectionState = ConnectionState.Closed;
         }
 
@@ -176,7 +198,7 @@ namespace Snowflake.Data.Client
         }
 #endif
 
-        public virtual Task CloseAsync(CancellationToken cancellationToken)
+        public virtual async Task CloseAsync(CancellationToken cancellationToken)
         {
             logger.Debug("Close Connection.");
             TaskCompletionSource<object> taskCompletionSource = new TaskCompletionSource<object>();
@@ -189,17 +211,15 @@ namespace Snowflake.Data.Client
             {
                 if (IsNonClosedWithSession())
                 {
-                    var transactionRollbackStatus = SnowflakeDbConnectionPool.GetPooling() ? TerminateTransactionForDirtyConnectionReturningToPool() : TransactionRollbackStatus.Undefined;
-
-                    if (CanReuseSession(transactionRollbackStatus) && SnowflakeDbConnectionPool.AddSession(SfSession))
+                    var returnedToPool = TryToReturnSessionToPool();
+                    if (returnedToPool)
                     {
-                        logger.Debug($"Session pooled: {SfSession.sessionId}");
                         _connectionState = ConnectionState.Closed;
                         taskCompletionSource.SetResult(null);
                     }
                     else
                     {
-                        SfSession.CloseAsync(cancellationToken).ContinueWith(
+                        await SfSession.CloseAsync(cancellationToken).ContinueWith(
                             previousTask =>
                             {
                                 if (previousTask.IsFaulted)
@@ -220,7 +240,7 @@ namespace Snowflake.Data.Client
                                     _connectionState = ConnectionState.Closed;
                                     taskCompletionSource.SetResult(null);
                                 }
-                            }, cancellationToken);
+                            }, cancellationToken).ConfigureAwait(false);
                     }
                 }
                 else
@@ -229,15 +249,15 @@ namespace Snowflake.Data.Client
                     taskCompletionSource.SetResult(null);
                 }
             }
-            return taskCompletionSource.Task;
+            await taskCompletionSource.Task;
         }
 
         protected virtual bool CanReuseSession(TransactionRollbackStatus transactionRollbackStatus)
         {
-            return SnowflakeDbConnectionPool.GetPooling() && 
+            return SnowflakeDbConnectionPool.GetPooling() &&
                    transactionRollbackStatus == TransactionRollbackStatus.Success;
         }
-        
+
         public override void Open()
         {
             logger.Debug("Open Connection.");
@@ -302,6 +322,7 @@ namespace Snowflake.Data.Client
                     {
                         _connectionState = ConnectionState.Closed;
                         logger.Debug("Connection canceled");
+                        throw new TaskCanceledException("Connecting was cancelled");
                     }
                     else
                     {
@@ -310,8 +331,7 @@ namespace Snowflake.Data.Client
                         logger.Debug($"Connection open with pooled session: {SfSession.sessionId}");
                         OnSessionEstablished();
                     }
-                },
-                cancellationToken);
+                }, TaskContinuationOptions.None); // this continuation should be executed always (even if the whole operation was canceled) because it sets the proper state of the connection
         }
 
         public Mutex GetArrayBindingMutex()
@@ -377,11 +397,11 @@ namespace Snowflake.Data.Client
                 }
                 else
                 {
-                    SfSession?.close();
+                    SfSession?.CloseNonBlocking();
                     SfSession = null;
                     _connectionState = ConnectionState.Closed;
                 }
-                
+
                 _disposed = true;
             }
 
@@ -400,6 +420,16 @@ namespace Snowflake.Data.Client
             {
                 externalCancellationToken.Register(() => { _connectionState = ConnectionState.Closed; });
             }
+        }
+
+        public bool IsStillRunning(QueryStatus status)
+        {
+            return QueryStatusExtensions.IsStillRunning(status);
+        }
+
+        public bool IsAnError(QueryStatus status)
+        {
+            return QueryStatusExtensions.IsAnError(status);
         }
 
         ~SnowflakeDbConnection()

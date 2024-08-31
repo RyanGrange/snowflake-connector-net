@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright (c) 2012-2021 Snowflake Computing Inc. All rights reserved.
  */
 
@@ -11,7 +11,9 @@ using Snowflake.Data.Client;
 using Snowflake.Data.Core.Authenticator;
 using System.Data.Common;
 using System.Linq;
+using System.Text;
 using System.Text.RegularExpressions;
+using Snowflake.Data.Core.Tools;
 
 namespace Snowflake.Data.Core
 {
@@ -23,7 +25,7 @@ namespace Snowflake.Data.Core
         DB,
         [SFSessionPropertyAttr(required = false)]
         HOST,
-        [SFSessionPropertyAttr(required = true)]
+        [SFSessionPropertyAttr(required = true, IsSecret = true)]
         PASSWORD,
         [SFSessionPropertyAttr(required = false, defaultValue = "443")]
         PORT,
@@ -45,11 +47,11 @@ namespace Snowflake.Data.Core
         VALIDATE_DEFAULT_PARAMETERS,
         [SFSessionPropertyAttr(required = false)]
         PRIVATE_KEY_FILE,
-        [SFSessionPropertyAttr(required = false)]
+        [SFSessionPropertyAttr(required = false, IsSecret = true)]
         PRIVATE_KEY_PWD,
-        [SFSessionPropertyAttr(required = false)]
+        [SFSessionPropertyAttr(required = false, IsSecret = true)]
         PRIVATE_KEY,
-        [SFSessionPropertyAttr(required = false)]
+        [SFSessionPropertyAttr(required = false, IsSecret = true)]
         TOKEN,
         [SFSessionPropertyAttr(required = false, defaultValue = "false")]
         INSECUREMODE,
@@ -61,7 +63,7 @@ namespace Snowflake.Data.Core
         PROXYPORT,
         [SFSessionPropertyAttr(required = false)]
         PROXYUSER,
-        [SFSessionPropertyAttr(required = false)]
+        [SFSessionPropertyAttr(required = false, IsSecret = true)]
         PROXYPASSWORD,
         [SFSessionPropertyAttr(required = false)]
         NONPROXYHOSTS,
@@ -90,7 +92,27 @@ namespace Snowflake.Data.Core
         [SFSessionPropertyAttr(required = false, defaultValue = "false")]
         DISABLEQUERYCONTEXTCACHE,
         [SFSessionPropertyAttr(required = false)]
-        CLIENT_CONFIG_FILE
+        CLIENT_CONFIG_FILE,
+        [SFSessionPropertyAttr(required = false, defaultValue = "true")]
+        DISABLE_CONSOLE_LOGIN,
+        [SFSessionPropertyAttr(required = false, defaultValue = "false")]
+        ALLOWUNDERSCORESINHOST,
+        [SFSessionPropertyAttr(required = false)]
+        QUERY_TAG,
+        [SFSessionPropertyAttr(required = false, defaultValue = "10")]
+        MAXPOOLSIZE,
+        [SFSessionPropertyAttr(required = false, defaultValue = "2")]
+        MINPOOLSIZE,
+        [SFSessionPropertyAttr(required = false, defaultValue = "Destroy")]
+        CHANGEDSESSION,
+        [SFSessionPropertyAttr(required = false, defaultValue = "30s")]
+        WAITINGFORIDLESESSIONTIMEOUT,
+        [SFSessionPropertyAttr(required = false, defaultValue = "60m")]
+        EXPIRATIONTIMEOUT,
+        [SFSessionPropertyAttr(required = false, defaultValue = "true")]
+        POOLINGENABLED,
+        [SFSessionPropertyAttr(required = false, defaultValue = "false")]
+        DISABLE_SAML_URL_CHECK
     }
 
     class SFSessionPropertyAttr : Attribute
@@ -98,23 +120,31 @@ namespace Snowflake.Data.Core
         public bool required { get; set; }
 
         public string defaultValue { get; set; }
+
+        public bool IsSecret { get; set; } = false;
     }
 
     class SFSessionProperties : Dictionary<SFSessionProperty, String>
     {
         private static SFLogger logger = SFLoggerFactory.GetLogger<SFSessionProperties>();
 
+        internal string ConnectionStringWithoutSecrets { get; set; }
+
+        internal bool IsPoolingEnabledValueProvided { get; set; }
+
         // Connection string properties to obfuscate in the log
-        private static List<SFSessionProperty> secretProps =
-            new List<SFSessionProperty>{
-                SFSessionProperty.PASSWORD,
-                SFSessionProperty.PRIVATE_KEY,
-                SFSessionProperty.TOKEN,
-                SFSessionProperty.PRIVATE_KEY_PWD,
-                SFSessionProperty.PROXYPASSWORD,
-            };
-        
-        private const string AccountRegexString = "^\\w[\\w.-]+\\w$";
+        private static readonly List<string> s_secretProps = Enum.GetValues(typeof(SFSessionProperty))
+            .Cast<SFSessionProperty>()
+            .Where(p => p.GetAttribute<SFSessionPropertyAttr>().IsSecret)
+            .Select(p => p.ToString())
+            .ToList();
+
+        private static readonly List<string> s_accountRegexStrings = new List<string>
+        {
+            "^\\w",
+            "\\w$",
+            "^[\\w.-]+$"
+        };
 
         public override bool Equals(object obj)
         {
@@ -151,12 +181,12 @@ namespace Snowflake.Data.Core
             return base.GetHashCode();
         }
 
-        internal static SFSessionProperties parseConnectionString(String connectionString, SecureString password)
+        internal static SFSessionProperties ParseConnectionString(string connectionString, SecureString password)
         {
             logger.Info("Start parsing connection string.");
-            DbConnectionStringBuilder builder = new DbConnectionStringBuilder();
+            var builder = new DbConnectionStringBuilder();
             try
-            { 
+            {
                 builder.ConnectionString = connectionString;
             }
             catch (ArgumentException e)
@@ -166,14 +196,16 @@ namespace Snowflake.Data.Core
                                 SFError.INVALID_CONNECTION_STRING,
                                 e.Message);
             }
-            SFSessionProperties properties = new SFSessionProperties();
+            var properties = new SFSessionProperties();
 
-            string[] keys = new string[builder.Keys.Count];
-            string[] values = new string[builder.Values.Count];
+            var keys = new string[builder.Keys.Count];
+            var values = new string[builder.Values.Count];
             builder.Keys.CopyTo(keys, 0);
             builder.Values.CopyTo(values,0);
 
-            for(int i=0; i<keys.Length; i++)
+            properties.ConnectionStringWithoutSecrets = BuildConnectionStringWithoutSecrets(ref keys, ref values);
+
+            for(var i=0; i<keys.Length; i++)
             {
                 try
                 {
@@ -187,36 +219,9 @@ namespace Snowflake.Data.Core
                 }
             }
 
-            //handle DbConnectionStringBuilder missing cases
-            string[] propertyEntry = connectionString.Split(';');
-            foreach(string keyVal in propertyEntry)
-            {
-                if(keyVal.Length > 0)
-                {
-                    string[] tokens = keyVal.Split(new string[] { "=" }, StringSplitOptions.None);
-                    if(tokens[0].ToUpper() == "DB" || tokens[0].ToUpper() == "SCHEMA" ||
-                        tokens[0].ToLower() == "WAREHOUSE" || tokens[0].ToUpper() == "ROLE")
-                    {
-                        if (tokens.Length == 2)
-                        {
-                            SFSessionProperty p = (SFSessionProperty)Enum.Parse(
-                                typeof(SFSessionProperty), tokens[0].ToUpper());
-                            properties[p]= tokens[1];
-                        }
-                    }
-                    if(tokens[0].ToUpper() == "USER" || tokens[0].ToUpper() == "PASSWORD")
-                    {
-                        SFSessionProperty p = (SFSessionProperty)Enum.Parse(
-                                typeof(SFSessionProperty), tokens[0].ToUpper());
-                        if (!properties.ContainsKey(p))
-                        {
-                            properties.Add(p, "");
-                        }
-                    }
-                }
-            }
+            UpdatePropertiesForSpecialCases(properties, connectionString);
 
-            bool useProxy = false;
+            var useProxy = false;
             if (properties.ContainsKey(SFSessionProperty.USEPROXY))
             {
                 try
@@ -247,32 +252,150 @@ namespace Snowflake.Data.Core
                 }
             }
 
-            if (password != null)
+            if (password != null && password.Length > 0)
             {
-                properties[SFSessionProperty.PASSWORD] = new NetworkCredential(string.Empty, password).Password;
+                properties[SFSessionProperty.PASSWORD] = SecureStringHelper.Decode(password);
             }
 
-            checkSessionProperties(properties);
+            ValidateAuthenticator(properties);
+            properties.IsPoolingEnabledValueProvided = properties.IsNonEmptyValueProvided(SFSessionProperty.POOLINGENABLED);
+            CheckSessionProperties(properties);
             ValidateFileTransferMaxBytesInMemoryProperty(properties);
             ValidateAccountDomain(properties);
-            
+
+            var allowUnderscoresInHost = ParseAllowUnderscoresInHost(properties);
+
             // compose host value if not specified
             if (!properties.ContainsKey(SFSessionProperty.HOST) ||
                 (0 == properties[SFSessionProperty.HOST].Length))
             {
-                string hostName = String.Format("{0}.snowflakecomputing.com", properties[SFSessionProperty.ACCOUNT]);
+                var compliantAccountName = properties[SFSessionProperty.ACCOUNT];
+                if (!allowUnderscoresInHost && compliantAccountName.Contains('_'))
+                {
+                    compliantAccountName = compliantAccountName.Replace('_', '-');
+                    logger.Info($"Replacing _ with - in the account name. Old: {properties[SFSessionProperty.ACCOUNT]}, new: {compliantAccountName}.");
+                }
+                var hostName = $"{compliantAccountName}.snowflakecomputing.com";
                 // Remove in case it's here but empty
                 properties.Remove(SFSessionProperty.HOST);
                 properties.Add(SFSessionProperty.HOST, hostName);
                 logger.Info($"Compose host name: {hostName}");
             }
+            logger.Info(ResolveConnectionAreaMessage(properties[SFSessionProperty.HOST]));
 
             // Trim the account name to remove the region and cloud platform if any were provided
-            // because the login request data does not expect region and cloud information to be 
+            // because the login request data does not expect region and cloud information to be
             // passed on for account_name
             properties[SFSessionProperty.ACCOUNT] = properties[SFSessionProperty.ACCOUNT].Split('.')[0];
 
             return properties;
+        }
+
+        internal static string ResolveConnectionAreaMessage(string host) =>
+            host.EndsWith(".cn", StringComparison.InvariantCultureIgnoreCase)
+                ? "Connecting to CHINA Snowflake domain"
+                : "Connecting to GLOBAL Snowflake domain";
+
+        private static void ValidateAuthenticator(SFSessionProperties properties)
+        {
+            var knownAuthenticators = new[] {
+                BasicAuthenticator.AUTH_NAME,
+                OktaAuthenticator.AUTH_NAME,
+                OAuthAuthenticator.AUTH_NAME,
+                KeyPairAuthenticator.AUTH_NAME,
+                ExternalBrowserAuthenticator.AUTH_NAME
+            };
+
+            if (properties.TryGetValue(SFSessionProperty.AUTHENTICATOR, out var authenticator))
+            {
+                authenticator = authenticator.ToLower();
+                if (!knownAuthenticators.Contains(authenticator) && !(authenticator.Contains(OktaAuthenticator.AUTH_NAME) && authenticator.StartsWith("https://")))
+                {
+                    var error = $"Unknown authenticator: {authenticator}";
+                    logger.Error(error);
+                    throw new SnowflakeDbException(SFError.UNKNOWN_AUTHENTICATOR, authenticator);
+                }
+            }
+        }
+
+        internal bool IsNonEmptyValueProvided(SFSessionProperty property) =>
+            TryGetValue(property, out var propertyValueStr) && !string.IsNullOrEmpty(propertyValueStr);
+
+        private static string BuildConnectionStringWithoutSecrets(ref string[] keys, ref string[] values)
+        {
+            var count = keys.Length;
+            var result = new StringBuilder();
+            for (var i = 0; i < count; i++ )
+            {
+                if (!IsSecretProperty(keys[i]))
+                {
+                    result.Append(keys[i]);
+                    result.Append("=");
+                    result.Append(values[i]);
+                    result.Append(";");
+                }
+            }
+            return result.ToString();
+        }
+
+        private static bool IsSecretProperty(string propertyName)
+        {
+            return s_secretProps.Contains(propertyName, StringComparer.OrdinalIgnoreCase);
+        }
+
+        private static void UpdatePropertiesForSpecialCases(SFSessionProperties properties, string connectionString)
+        {
+            var propertyEntry = connectionString.Split(';');
+            foreach(var keyVal in propertyEntry)
+            {
+                if(keyVal.Length > 0)
+                {
+                    var tokens = keyVal.Split(new string[] { "=" }, StringSplitOptions.None);
+                    var propertyName = tokens[0].ToUpper();
+                    switch (propertyName)
+                    {
+                        case "DB":
+                        case "SCHEMA":
+                        case "WAREHOUSE":
+                        case "ROLE":
+                        {
+                            if (tokens.Length == 2)
+                            {
+                                var sessionProperty = (SFSessionProperty)Enum.Parse(
+                                    typeof(SFSessionProperty), propertyName);
+                                properties[sessionProperty]= ProcessObjectEscapedCharacters(tokens[1]);
+                            }
+
+                            break;
+                        }
+                        case "USER":
+                        case "PASSWORD":
+                        {
+
+                            var sessionProperty = (SFSessionProperty)Enum.Parse(
+                                typeof(SFSessionProperty), propertyName);
+                            if (!properties.ContainsKey(sessionProperty))
+                            {
+                                properties.Add(sessionProperty, "");
+                            }
+
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        private static string ProcessObjectEscapedCharacters(string objectValue)
+        {
+            var match = Regex.Match(objectValue, "^\"(.*)\"$");
+            if(match.Success)
+            {
+                var replaceEscapedQuotes = match.Groups[1].Value.Replace("\"\"", "\"");
+                return $"\"{replaceEscapedQuotes}\"";
+            }
+
+            return objectValue;
         }
 
         private static void ValidateAccountDomain(SFSessionProperties properties)
@@ -280,8 +403,7 @@ namespace Snowflake.Data.Core
             var account = properties[SFSessionProperty.ACCOUNT];
             if (string.IsNullOrEmpty(account))
                 return;
-            var match = Regex.Match(account, AccountRegexString, RegexOptions.IgnoreCase);
-            if (match.Success)
+            if (IsAccountRegexMatched(account))
                 return;
             logger.Error($"Invalid account {account}");
             throw new SnowflakeDbException(
@@ -291,7 +413,12 @@ namespace Snowflake.Data.Core
                 SFSessionProperty.ACCOUNT);
         }
 
-        private static void checkSessionProperties(SFSessionProperties properties)
+        private static bool IsAccountRegexMatched(string account) =>
+            s_accountRegexStrings
+                .Select(regex => Regex.Match(account, regex, RegexOptions.IgnoreCase))
+                .All(match => match.Success);
+
+        private static void CheckSessionProperties(SFSessionProperties properties)
         {
             foreach (SFSessionProperty sessionProperty in Enum.GetValues(typeof(SFSessionProperty)))
             {
@@ -299,9 +426,15 @@ namespace Snowflake.Data.Core
                 if (IsRequired(sessionProperty, properties) &&
                     !properties.ContainsKey(sessionProperty))
                 {
-                    SnowflakeDbException e = new SnowflakeDbException(SFError.MISSING_CONNECTION_PROPERTY,
-                        sessionProperty);
+                    SnowflakeDbException e = new SnowflakeDbException(SFError.MISSING_CONNECTION_PROPERTY, sessionProperty);
                     logger.Error("Missing connection property", e);
+                    throw e;
+                }
+
+                if (IsRequired(sessionProperty, properties) && string.IsNullOrEmpty(properties[sessionProperty]))
+                {
+                    SnowflakeDbException e = new SnowflakeDbException(SFError.MISSING_CONNECTION_PROPERTY, sessionProperty);
+                    logger.Error("Empty connection property", e);
                     throw e;
                 }
 
@@ -309,7 +442,7 @@ namespace Snowflake.Data.Core
                 string defaultVal = sessionProperty.GetAttribute<SFSessionPropertyAttr>().defaultValue;
                 if (defaultVal != null && !properties.ContainsKey(sessionProperty))
                 {
-                    logger.Debug($"Sesssion property {sessionProperty} set to default value: {defaultVal}");
+                    logger.Debug($"Session property {sessionProperty} set to default value: {defaultVal}");
                     properties.Add(sessionProperty, defaultVal);
                 }
             }
@@ -333,7 +466,7 @@ namespace Snowflake.Data.Core
                 logger.Error($"Value for parameter {propertyName} could not be parsed");
                 throw new SnowflakeDbException(e, SFError.INVALID_CONNECTION_PARAMETER_VALUE, maxBytesInMemoryString, propertyName);
             }
-            
+
             if (maxBytesInMemory <= 0)
             {
                 logger.Error($"Value for parameter {propertyName} should be greater than 0");
@@ -342,7 +475,7 @@ namespace Snowflake.Data.Core
                     SFError.INVALID_CONNECTION_PARAMETER_VALUE, maxBytesInMemoryString, propertyName);
             }
         }
-        
+
         private static bool IsRequired(SFSessionProperty sessionProperty, SFSessionProperties properties)
         {
             if (sessionProperty.Equals(SFSessionProperty.PASSWORD))
@@ -373,10 +506,33 @@ namespace Snowflake.Data.Core
                 return !authenticatorDefined || !authenticatorsWithoutUsername
                     .Any(auth => auth.Equals(authenticator, StringComparison.OrdinalIgnoreCase));
             }
+            else if (sessionProperty.Equals(SFSessionProperty.TOKEN))
+            {
+                var authenticatorDefined = properties.TryGetValue(SFSessionProperty.AUTHENTICATOR, out var authenticator);
+
+                return !authenticatorDefined || authenticator.Equals(OAuthAuthenticator.AUTH_NAME);
+            }
             else
             {
                 return sessionProperty.GetAttribute<SFSessionPropertyAttr>().required;
             }
+        }
+
+        private static bool ParseAllowUnderscoresInHost(SFSessionProperties properties)
+        {
+            var allowUnderscoresInHost = bool.Parse(SFSessionProperty.ALLOWUNDERSCORESINHOST.GetAttribute<SFSessionPropertyAttr>().defaultValue);
+            if (!properties.TryGetValue(SFSessionProperty.ALLOWUNDERSCORESINHOST, out var property))
+                return allowUnderscoresInHost;
+            try
+            {
+                allowUnderscoresInHost = bool.Parse(property);
+            }
+            catch (Exception e)
+            {
+                logger.Warn("Unable to parse property 'allowUnderscoresInHost'", e);
+            }
+
+            return allowUnderscoresInHost;
         }
     }
 
